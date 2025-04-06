@@ -25,6 +25,88 @@ import tyro
 import mani_skill.envs
 
 
+
+######### MY CUSTOM TOOLS FOR TRANSFORMER-BASED ONLINE MANISKILL #########
+class ResetTracker:
+    def __init__(self, n_envs, max_steps):
+        self.n_envs = n_envs  # Количество сред
+        self.max_steps = max_steps  # Максимальное количество шагов до удаления индекса
+        self.step_counts = {}  # Хранит шаги после ресета {индекс среды: кол-во шагов}
+
+    def add(self, reset_indices):
+        """Регистрирует сброс для указанных индексов."""
+        for index in reset_indices:
+            if 0 <= index < self.n_envs: 
+                self.step_counts[index] = 1  # Обнуляем счётчик шагов для этих индексов
+            else:
+                print('Error!')    
+
+    def step(self):
+        """Обновляет шаги для всех зарегистрированных индексов и удаляет просроченные."""
+        to_remove = []
+        for index in self.step_counts.keys():
+            self.step_counts[index] += 1
+            if self.step_counts[index] >= self.max_steps: # как только набираем необходимый контекст - удаляем индекс
+                to_remove.append(index)
+        for index in to_remove:
+            del self.step_counts[index]
+
+    def get_info(self, idx):
+        return self.step_counts[idx]
+    
+    
+    def get_active_indices(self):
+        """Потом исп-ть эту ф-ю для нарезки данных. 
+        Т.е. сначала срезаем всё, а затем на основе этих индексов корректируем срез"""
+        return list(self.step_counts.keys())
+
+
+def smart_slice(observations, context, tracker):
+    """Возвращает срез observations с паддингом при недостатке шагов."""
+    num_envs, seq_len, state_dim = observations.shape
+    
+    observations2RB = []
+    next_observations2RB = []
+
+    if seq_len >= context:
+        for env_index in range(num_envs):
+            if env_index in tracker.step_counts.keys(): # если эта среда нуждается в аккуратном срезе
+                steps_since_reset = tracker.get_info(env_index)  # узнаём сколько шагов простепали после ресета
+                padding_size = context - steps_since_reset       # считаем сколько шагов надо допадить
+                padding = observations[env_index, -steps_since_reset, :].unsqueeze(0).repeat(padding_size, 1) # формируем паддинг
+                valid_states = observations[env_index, -steps_since_reset:, :]
+                next_obs = torch.cat([padding, valid_states], dim=0)  # работает если после ресета прошло мин 2 степа
+                obs = torch.cat([ padding[0].unsqueeze(0), padding, valid_states[:-1,:] ], dim=0)# работает если после ресета прошло мин 2 степа
+                next_observations2RB.append(next_obs)
+                observations2RB.append(obs)
+            elif env_index not in tracker.step_counts.keys():
+                next_obs = observations[env_index, -context:, :] # всегда cont, s_d
+                obs = torch.cat([ next_obs[0,:].unsqueeze(0), next_obs[:-1,:] ])   # а точно ли я должен next_obs[0,:] добавлять или надо просто другой срез сделать? 
+                next_observations2RB.append(next_obs)
+                observations2RB.append(obs)
+        
+        return torch.stack(observations2RB), torch.stack(next_observations2RB)    
+    
+    else:                
+        padding_size = context - seq_len
+        padding = observations[:, 0, :].unsqueeze(1).repeat(1, padding_size, 1)  # паддинг первым состоянием
+
+        
+        next_obs = torch.cat([padding, observations], dim=1)
+
+        obs = torch.cat([
+                observations[:, 0, :].unsqueeze(1),  # начальное состояние
+                padding,
+                observations[:,:-1, :]
+            ], dim=1)
+
+    return obs, next_obs
+
+
+
+
+
+
 @dataclass
 class Args:
     exp_name: Optional[str] = None
@@ -43,11 +125,11 @@ class Args:
     """the entity (team) of wandb's project"""
     wandb_group: str = "SAC"
     """the group of the run for wandb"""
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_trajectory: bool = False
     """whether to save trajectory data into the `videos` folder"""
-    save_model: bool = True
+    save_model: bool = False
     """whether to save model into the `runs/{run_name}` folder"""
     evaluate: bool = False
     """if toggled, only runs evaluation with the given model checkpoint and saves the evaluation trajectories"""
@@ -61,7 +143,7 @@ class Args:
     """the id of the environment"""
     env_vectorization: str = "gpu"
     """the type of environment vectorization to use"""
-    num_envs: int = 16
+    num_envs: int = 50
     """the number of parallel environments"""
     num_eval_envs: int = 16
     """the number of parallel evaluation environments"""
@@ -77,7 +159,7 @@ class Args:
     """how often to reconfigure the environment during training"""
     eval_reconfiguration_freq: Optional[int] = 1
     """for benchmarking purposes we want to reconfigure the eval environment each reset to ensure objects are randomized in some tasks"""
-    eval_freq: int = 25
+    eval_freq: int = 50000
     """evaluation frequency in terms of iterations"""
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
@@ -87,6 +169,8 @@ class Args:
     # Algorithm specific arguments
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
+    context: int = 10
+    """transformer context"""
     buffer_size: int = 1_000_000
     """the replay memory buffer size"""
     buffer_device: str = "cuda"
@@ -121,7 +205,7 @@ class Args:
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
 
     # to be filled in runtime
-    grad_steps_per_iteration: int = 0
+    grad_steps_per_iteration: int = 0 # = training_freq*utd=32 by default 
     """the number of gradient updates per iteration"""
     steps_per_env: int = 0
     """the number of steps each parallel env takes per iteration"""
@@ -148,7 +232,7 @@ class ReplayBuffer:
         self.logprobs = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
         self.rewards = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
         self.dones = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
-        self.values = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
+        self.values = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device) 
 
     def add(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
         if self.storage_device == torch.device("cpu"):
@@ -272,8 +356,8 @@ class Logger:
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.grad_steps_per_iteration = int(args.training_freq * args.utd)
-    args.steps_per_env = args.training_freq // args.num_envs
+    args.grad_steps_per_iteration = int(args.training_freq * args.utd) #32
+    args.steps_per_env = args.training_freq // args.num_envs           #64/32=2
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -292,8 +376,10 @@ if __name__ == "__main__":
     env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="gpu")
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
+    
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, human_render_camera_configs=dict(shader_pack="default"), **env_kwargs)
+    
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
@@ -306,8 +392,10 @@ if __name__ == "__main__":
             save_video_trigger = lambda x : (x // args.num_steps) % args.save_train_video_freq == 0
             envs = RecordEpisode(envs, output_dir=f"runs/{run_name}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=30)
         eval_envs = RecordEpisode(eval_envs, output_dir=eval_output_dir, save_trajectory=args.save_trajectory, save_video=args.capture_video, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=30)
+    
     envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
     eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
+    
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
@@ -381,21 +469,38 @@ if __name__ == "__main__":
     global_update = 0
     learning_has_started = False
 
-    global_steps_per_iteration = args.num_envs * (args.steps_per_env)
+    global_steps_per_iteration = args.num_envs * (args.steps_per_env) # 32*2=64
     pbar = tqdm.tqdm(range(args.total_timesteps))
     cumulative_times = defaultdict(float)
 
+    
+    
+    tracker = ResetTracker(n_envs=args.num_envs, max_steps=args.context)
+    global_observations = torch.empty((args.num_envs, 0, envs.single_observation_space.shape[0])).to(device)   #n_e, 0, s_d
+    global_observations = torch.cat([global_observations, obs.unsqueeze(1)], dim=1)
+    
     while global_step < args.total_timesteps:
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # evaluate
             actor.eval()
             stime = time.perf_counter()
+            
             eval_obs, _ = eval_envs.reset()
+            eval_observations = torch.empty((args.num_eval_envs, 0, envs.single_observation_space.shape[0])).to(device)   #n_e, 0, s_d
+            eval_observations = torch.cat([eval_observations, eval_obs.unsqueeze(1)], dim=1)
+            
             eval_metrics = defaultdict(list)
             num_episodes = 0
-            for _ in range(args.num_eval_steps):
+            for _ in range(args.num_eval_steps):  #num_eval_steps = 50
+                
+                if eval_observations.shape[1] > args.context:
+                    eval_observations = eval_observations[:, -args.context:,]
+                
+                
                 with torch.no_grad():
-                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(actor.get_eval_action(eval_obs))
+                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(actor.get_eval_action(eval_observations[:,-1,:]))
+                    eval_observations = torch.cat([eval_observations, eval_obs.unsqueeze(1)], dim=1)
+                    
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -429,20 +534,35 @@ if __name__ == "__main__":
             #     }, model_path)
             #     print(f"model saved to {model_path}")
 
+        
+##############################################################################################################
+##############################################################################################################        
+##############################################################################################################
+        
         # Collect samples from environemnts
         rollout_time = time.perf_counter()
         for local_step in range(args.steps_per_env):
             global_step += 1 * args.num_envs
-
-            # ALGO LOGIC: put action logic here
+            
+            if global_observations.shape[1] > args.context:
+                global_observations = global_observations[:, -args.context-1:,]
+            obs2act = smart_slice(global_observations, args.context, tracker)[1]
+            
             if not learning_has_started:
                 actions = torch.tensor(envs.action_space.sample(), dtype=torch.float32, device=device)
             else:
-                actions, _, _ = actor.get_action(obs)
+                actions, _, _ = actor.get_action(obs2act[:,-1,:])
                 actions = actions.detach()
 
+            
+            
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+            
+            global_observations = torch.cat([global_observations, next_obs.unsqueeze(1)], dim=1)
+            #tracker.step() 
+            
+            
             real_next_obs = next_obs.clone()
             if args.bootstrap_at_done == 'never':
                 need_final_obs = torch.ones_like(terminations, dtype=torch.bool)
@@ -460,14 +580,33 @@ if __name__ == "__main__":
                 real_next_obs[need_final_obs] = infos["final_observation"][need_final_obs]
                 for k, v in final_info["episode"].items():
                     logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
-
-            rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
+            
+                   
+            
+            obs2RB, n_obs2RB = smart_slice(global_observations, args.context, tracker)
+            
+            #rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
+            rb.add(obs2RB[:,-1,:], n_obs2RB[:,-1,:], actions, rewards, stop_bootstrap)
+            
+            
+            # if infos['episode']['success_once'].any():
+            #     success_indices = torch.where(infos['episode']['success_once'])[0].tolist() # выводим индексы тех сред где случился success
+            #     reseted_obs, _ = envs.reset(options={"env_idx":success_indices}) # обновляем только те среды, в который словили sr_once. при этом остальныве среды остаются неизменными
+            #     tracker.add(success_indices)
+            #     global_observations[:,-1,:] = reseted_obs
+               
 
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             obs = next_obs
         rollout_time = time.perf_counter() - rollout_time
         cumulative_times["rollout_time"] += rollout_time
         pbar.update(args.num_envs * args.steps_per_env)
+
+        
+##############################################################################################################
+##############################################################################################################        
+##############################################################################################################
+ 
 
         # ALGO LOGIC: training.
         if global_step < args.learning_starts:
@@ -478,6 +617,8 @@ if __name__ == "__main__":
         for local_update in range(args.grad_steps_per_iteration):
             global_update += 1
             data = rb.sample(args.batch_size)
+            
+            
 
             # update the value networks
             with torch.no_grad():
