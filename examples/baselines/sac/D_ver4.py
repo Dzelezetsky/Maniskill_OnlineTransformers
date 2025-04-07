@@ -217,8 +217,8 @@ class Args:
     """use gatings instead skip connection in transformer block"""
     n_embd: int = 256
     """inner transformer dimention"""
-    n_layer: int = 3
-    n_head: int = 4
+    n_layer: int = 1
+    n_head: int = 2
     dropout: float = 0.0
     seq_len: int = 10
     bias: bool = True
@@ -885,8 +885,9 @@ if __name__ == "__main__":
                     logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
             
                    
-            
-            obs2RB, n_obs2RB = smart_slice(global_observations, args.seq_len, tracker)
+            real_global_observations = global_observations.clone()
+            real_global_observations[:,-1,:] = real_next_obs
+            obs2RB, n_obs2RB = smart_slice(real_global_observations, args.seq_len, tracker)
             
             
             rb.add(obs2RB, n_obs2RB, actions, rewards, stop_bootstrap)   # RB* <-- (ne,cont,sd), (ne,cont,sd), (ne,ad), (ne), (ne) 
