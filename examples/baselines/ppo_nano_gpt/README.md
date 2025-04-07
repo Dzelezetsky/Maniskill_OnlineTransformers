@@ -26,3 +26,7 @@ PokeCube-v1:
 PickSingleYCB-v1:
 
 <img width="311" alt="image" src="https://github.com/user-attachments/assets/123178af-50fd-4e9f-a241-c8159ec3a4f3" />
+
+TriFingerRotateCubeLevel0-v1:
+
+<img width="305" alt="image" src="https://github.com/user-attachments/assets/cc22a18b-994b-42d0-abd2-46c94e0bb2e7" />
