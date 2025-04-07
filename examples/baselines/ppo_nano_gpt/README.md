@@ -1,4 +1,4 @@
-## Current results with context=1: 
+## Current results on states with context=1: 
 
 PushCube-v1:
 
@@ -30,3 +30,8 @@ PickSingleYCB-v1:
 TriFingerRotateCubeLevel0-v1:
 
 <img width="305" alt="image" src="https://github.com/user-attachments/assets/cc22a18b-994b-42d0-abd2-46c94e0bb2e7" />
+
+OpenCabinetDrawer-v1:
+
+<img width="313" alt="image" src="https://github.com/user-attachments/assets/618e2dc3-be7f-4d28-ac38-b675195b79f0" />
+
