@@ -213,6 +213,7 @@ class Args:
     
     ##### SPECIAL ARGS FOR TRANSFORMER  ##########
     
+    freeze : bool = False
     use_gates: bool = False
     """use gatings instead skip connection in transformer block"""
     n_embd: int = 256
@@ -439,9 +440,14 @@ class GPT(nn.Module):
         return x
     
 class Actor(nn.Module):
-    def __init__(self, env, args):
+    def __init__(self, env, args, transformer=None):
         super().__init__()
-        self.transformer = GPT(args)
+        
+        if transformer is not None:
+            self.transformer = transformer
+        else:            
+            self.transformer = GPT(args)
+        
         self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
         
         self.head = nn.Sequential(
@@ -568,10 +574,13 @@ class SoftQNetwork(nn.Module):
     '''
     Q-network for Transformer-based maniskill tasks
     '''
-    def __init__(self, env, args):
+    def __init__(self, env, args, transformer=None):
         super().__init__()
         
-        self.transformer = GPT(args)
+        if transformer is not None:
+            self.transformer = transformer
+        else:            
+            self.transformer = GPT(args)
         self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
         self.net = nn.Sequential(
             nn.Linear(args.n_embd + np.prod(env.single_action_space.shape), 256),
@@ -658,6 +667,12 @@ class Logger:
     def close(self):
         self.writer.close()
 
+
+
+
+
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.grad_steps_per_iteration = int(args.training_freq * args.utd) #32
@@ -733,20 +748,45 @@ if __name__ == "__main__":
 
     max_action = float(envs.single_action_space.high[0])
 
-    actor = Actor(envs, args).to(device)
-    qf1 = SoftQNetwork(envs, args).to(device)
-    qf2 = SoftQNetwork(envs, args).to(device)
-    qf1_target = SoftQNetwork(envs, args).to(device)
-    qf2_target = SoftQNetwork(envs, args).to(device)
+##################################################################################
+
+    shared_transformer = GPT(args)    
+    
+    actor = Actor(envs, args, shared_transformer).to(device)
+    qf1 = SoftQNetwork(envs, args, shared_transformer).to(device)
+    qf2 = SoftQNetwork(envs, args, shared_transformer).to(device)
+    
+    shared_transformer_target = GPT(args)
+    
+    qf1_target = SoftQNetwork(envs, args, shared_transformer_target).to(device)
+    qf2_target = SoftQNetwork(envs, args, shared_transformer_target).to(device)
+    
+    
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint)
         actor.load_state_dict(ckpt['actor'])
         qf1.load_state_dict(ckpt['qf1'])
         qf2.load_state_dict(ckpt['qf2'])
+    
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    
+    actor_params = [p for n, p in actor.named_parameters() if "transformer" not in n]
+    q_params = [p for n, p in list(qf1.named_parameters()) + list(qf2.named_parameters()) if "transformer" not in n]
+    
+    transformer_params = list(shared_transformer.parameters())
+    actor_transformer_params = transformer_params
+    q_transformer_params = transformer_params
+    
+    actor_optimizer = optim.Adam([
+        {'params': actor_params, 'lr': args.policy_lr}, 
+        {'params': actor_transformer_params, 'lr': args.policy_lr}  
+    ])
+
+    q_optimizer = optim.Adam([
+        {'params': q_params, 'lr': args.q_lr},  
+        {'params': q_transformer_params, 'lr': args.q_lr}  
+    ])
 
     # Automatic entropy tuning
     if args.autotune:
@@ -941,6 +981,15 @@ if __name__ == "__main__":
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
                 # data.dones is "stop_bootstrap", which is computed earlier according to args.bootstrap_at_done
 
+            if args.freeze:
+                ### MODIFICATION: FREEZE TRANSFORMER
+                for param in qf1.transformer.parameters():
+                    param.requires_grad = False
+
+                for param in qf2.transformer.parameters():
+                    param.requires_grad = False
+            
+            
             qf1_a_values = qf1(data.obs, data.actions).view(-1)
             qf2_a_values = qf2(data.obs, data.actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
@@ -951,6 +1000,15 @@ if __name__ == "__main__":
             qf_loss.backward()
             q_optimizer.step()
 
+            
+            
+            if args.freeze:
+                for param in qf1.transformer.parameters():
+                    param.requires_grad = True
+
+                for param in qf2.transformer.parameters():
+                    param.requires_grad = True
+                    
             # update the policy network
             if global_update % args.policy_frequency == 0:  # TD 3 Delayed update support
                 pi, log_pi, _ = actor.get_action(data.obs)
