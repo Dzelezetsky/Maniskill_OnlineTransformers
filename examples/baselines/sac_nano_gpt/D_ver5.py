@@ -734,10 +734,10 @@ if __name__ == "__main__":
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs, args).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
+    qf1 = SoftQNetwork(envs, args).to(device)
+    qf2 = SoftQNetwork(envs, args).to(device)
+    qf1_target = SoftQNetwork(envs, args).to(device)
+    qf2_target = SoftQNetwork(envs, args).to(device)
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint)
         actor.load_state_dict(ckpt['actor'])
