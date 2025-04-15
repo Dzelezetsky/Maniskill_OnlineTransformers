@@ -1,3 +1,14 @@
+# State-based enviroments:
+
+## PushT (16h on h100)
+
+
+
+## 
+
+
+# RGB-based enviroments:
+
 # Soft Actor Critic (SAC)
 
 Code for running the SAC RL algorithm is adapted from [CleanRL](https://github.com/vwxyzjn/cleanrl/) and our previous [ManiSkill Baselines](https://github.com/tongzhoumu/ManiSkill_Baselines/). It is written to be single-file and easy to follow/read, and supports state-based RL code.
