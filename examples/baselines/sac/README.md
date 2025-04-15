@@ -2,12 +2,20 @@
 
 ## PushT (16h on h100)
 
+<img width="308" alt="image" src="https://github.com/user-attachments/assets/49a1133a-06d4-4d31-97c0-e8fdf34ed3d7" />
 
 
 ## 
 
 
 # RGB-based enviroments:
+
+
+
+
+-----
+-----
+-----
 
 # Soft Actor Critic (SAC)
 
