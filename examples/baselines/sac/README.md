@@ -5,7 +5,9 @@
 <img width="308" alt="image" src="https://github.com/user-attachments/assets/49a1133a-06d4-4d31-97c0-e8fdf34ed3d7" />
 
 
-## 
+## PickCube (40min on h100)
+
+<img width="300" alt="image" src="https://github.com/user-attachments/assets/a80ea3e1-5a5a-4e66-948c-410bd1b2a2ae" />
 
 
 # RGB-based enviroments:
