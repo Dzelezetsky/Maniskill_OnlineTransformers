@@ -1,4 +1,4 @@
-#State-based enviroments:
+# State-based enviroments:
 
 
-#RGB-based enviroments:
+# RGB-based enviroments:
