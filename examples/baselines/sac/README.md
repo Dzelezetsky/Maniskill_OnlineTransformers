@@ -15,6 +15,7 @@
 
 ## StackCube (8h on h100)
 
+<img width="300" alt="image" src="https://github.com/user-attachments/assets/033f3e68-bc79-40b8-a6e7-175388885fb5" />
 
 
 ## TwoRobotStackCube (8h on h100)
