@@ -5,7 +5,7 @@
 
 
 
-seed=(1 2 3)
+seed=(3)
 
 for seed in ${seed[@]}
 do
