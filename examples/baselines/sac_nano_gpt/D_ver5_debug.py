@@ -670,6 +670,9 @@ if __name__ == "__main__":
     else:
         run_name = args.exp_name
 
+    print(args.partial_reset)
+    print(args.eval_partial_reset)
+    
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
