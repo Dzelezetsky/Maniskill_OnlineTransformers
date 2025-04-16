@@ -70,30 +70,16 @@ def smart_slice(observations, context, tracker):
 
     if seq_len >= context:
         for env_index in range(num_envs):
-            if env_index in tracker.step_counts.keys(): # если эта среда нуждается в аккуратном срезе
-                steps_since_reset = tracker.get_info(env_index)  # узнаём сколько шагов простепали после ресета
-                padding_size = context - steps_since_reset       # считаем сколько шагов надо допадить
-                padding = observations[env_index, -steps_since_reset, :].unsqueeze(0).repeat(padding_size, 1) # формируем паддинг
-                valid_states = observations[env_index, -steps_since_reset:, :]
-                next_obs = torch.cat([padding, valid_states], dim=0)  # работает если после ресета прошло мин 2 степа
-                obs = torch.cat([ padding[0].unsqueeze(0), padding, valid_states[:-1,:] ], dim=0)# работает если после ресета прошло мин 2 степа
-                next_observations2RB.append(next_obs)
-                observations2RB.append(obs)
-            elif env_index not in tracker.step_counts.keys():
-                next_obs = observations[env_index, -context:, :] # всегда cont, s_d
-                obs = torch.cat([ next_obs[0,:].unsqueeze(0), next_obs[:-1,:] ])   # а точно ли я должен next_obs[0,:] добавлять или надо просто другой срез сделать? 
-                next_observations2RB.append(next_obs)
-                observations2RB.append(obs)
-        
-        return torch.stack(observations2RB), torch.stack(next_observations2RB)    
+            next_obs = observations[env_index, -context:, :] # всегда cont, s_d
+            obs = torch.cat([ next_obs[0,:].unsqueeze(0), next_obs[:-1,:] ])   # а точно ли я должен next_obs[0,:] добавлять или надо просто другой срез сделать? 
+            next_observations2RB.append(next_obs)
+            observations2RB.append(obs)
     
+        return torch.stack(observations2RB), torch.stack(next_observations2RB)    
     else:                
         padding_size = context - seq_len
         padding = observations[:, 0, :].unsqueeze(1).repeat(1, padding_size, 1)  # паддинг первым состоянием
-
-        
         next_obs = torch.cat([padding, observations], dim=1)
-
         obs = torch.cat([
                 observations[:, 0, :].unsqueeze(1),  # начальное состояние
                 padding,

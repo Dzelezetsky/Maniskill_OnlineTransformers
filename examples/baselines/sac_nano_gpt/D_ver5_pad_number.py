@@ -73,7 +73,10 @@ def smart_slice(observations, context, tracker):
             if env_index in tracker.step_counts.keys(): # если эта среда нуждается в аккуратном срезе
                 steps_since_reset = tracker.get_info(env_index)  # узнаём сколько шагов простепали после ресета
                 padding_size = context - steps_since_reset       # считаем сколько шагов надо допадить
-                padding = observations[env_index, -steps_since_reset, :].unsqueeze(0).repeat(padding_size, 1) # формируем паддинг
+                # padding = observations[env_index, -steps_since_reset, :].unsqueeze(0).repeat(padding_size, 1) # формируем паддинг
+                true_padding = observations[env_index, -steps_since_reset, :].unsqueeze(0).repeat(padding_size, 1) # формируем паддинг
+                padding = torch.full(true_padding.shape, 999).to(observations.device) #torch.zeros
+                # print(f'{observations.shape=}')
                 valid_states = observations[env_index, -steps_since_reset:, :]
                 next_obs = torch.cat([padding, valid_states], dim=0)  # работает если после ресета прошло мин 2 степа
                 obs = torch.cat([ padding[0].unsqueeze(0), padding, valid_states[:-1,:] ], dim=0)# работает если после ресета прошло мин 2 степа
@@ -89,7 +92,8 @@ def smart_slice(observations, context, tracker):
     
     else:                
         padding_size = context - seq_len
-        padding = observations[:, 0, :].unsqueeze(1).repeat(1, padding_size, 1)  # паддинг первым состоянием
+        true_padding = observations[:, 0, :].unsqueeze(1).repeat(1, padding_size, 1)  # паддинг первым состоянием
+        padding = torch.full(true_padding.shape, 999).to(observations.device) #torch.zeros
 
         
         next_obs = torch.cat([padding, observations], dim=1)

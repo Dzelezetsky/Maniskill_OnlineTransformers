@@ -441,7 +441,8 @@ class GPT(nn.Module):
 class Actor(nn.Module):
     def __init__(self, env, args):
         super().__init__()
-        self.transformer = GPT(args)
+        #self.transformer = GPT(args)
+        self.lstm = nn.LSTM(input_size=args.n_embd, hidden_size=args.n_embd, batch_first=True)
         self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
         
         self.head = nn.Sequential(
@@ -462,7 +463,7 @@ class Actor(nn.Module):
 
     def forward(self, x):
         x = self.encoder(x)
-        x = self.transformer(x)[:,-1,:]
+        x = self.lstm(x)[0][:,-1,:]
         x = self.head(x)
         
         mean = self.fc_mean(x)
@@ -474,7 +475,7 @@ class Actor(nn.Module):
 
     def get_eval_action(self, x):
         x = self.encoder(x)
-        x = self.transformer(x)[:, -1, :]
+        x = self.lstm(x)[0][:, -1, :]
         x = self.head(x)
         
         mean = self.fc_mean(x)
@@ -571,7 +572,8 @@ class SoftQNetwork(nn.Module):
     def __init__(self, env, args):
         super().__init__()
         
-        self.transformer = GPT(args)
+        #self.transformer = GPT(args)
+        self.lstm = nn.LSTM(input_size=args.n_embd, hidden_size=args.n_embd, batch_first=True)
         self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
         self.net = nn.Sequential(
             nn.Linear(args.n_embd + np.prod(env.single_action_space.shape), 256),
@@ -585,7 +587,7 @@ class SoftQNetwork(nn.Module):
 
     def forward(self, x, a):                # x = (batch,cont,s_d)   a = (batch,a_d)
         x = self.encoder(x)                 # x = (batch,cont,n_embd)
-        x = self.transformer(x)[:, -1, :]   # x = (batch,n_embd)
+        x = self.lstm(x)[0][:, -1, :]   # x = (batch,n_embd)
         x = torch.cat([x, a], 1)            # x = (batch,n_embd+a_d)
         return self.net(x)                  # x = (batch,1)
 
@@ -901,7 +903,7 @@ if __name__ == "__main__":
             rb.add(obs2RB, n_obs2RB, actions, rewards, stop_bootstrap)   # RB* <-- (ne,cont,sd), (ne,cont,sd), (ne,ad), (ne), (ne) 
             
             
-            if 'episode' in infos and infos['episode']['success_once'].any():
+            if infos['episode']['success_once'].any():
                 success_indices = torch.where(infos['episode']['success_once'])[0].tolist() # выводим индексы тех сред где случился success
                 reseted_obs, _ = envs.reset(options={"env_idx":success_indices}) # обновляем только те среды, в который словили sr_once. при этом остальныве среды остаются неизменными
                 tracker.add(success_indices)
@@ -914,7 +916,7 @@ if __name__ == "__main__":
         cumulative_times["rollout_time"] += rollout_time
         pbar.update(args.num_envs * args.steps_per_env)
 
-
+        
 #↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 #↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓     TRAIN     ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓   
 #↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓

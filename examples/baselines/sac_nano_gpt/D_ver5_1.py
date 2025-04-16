@@ -442,12 +442,12 @@ class Actor(nn.Module):
     def __init__(self, env, args):
         super().__init__()
         self.transformer = GPT(args)
-        self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
+        self.encoder = nn.Sequential(nn.Linear(np.array(env.single_observation_space.shape).prod(), 256),
+                nn.ReLU(),
+                nn.Linear(256, args.n_embd))
         
         self.head = nn.Sequential(
             nn.Linear(args.n_embd, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
@@ -572,16 +572,30 @@ class SoftQNetwork(nn.Module):
         super().__init__()
         
         self.transformer = GPT(args)
-        self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
+        self.encoder = nn.Sequential(
+            nn.Linear(np.array(env.single_observation_space.shape).prod(), 256),
+            nn.ReLU(),
+            nn.Linear(256, args.n_embd))
+
         self.net = nn.Sequential(
             nn.Linear(args.n_embd + np.prod(env.single_action_space.shape), 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
             nn.Linear(256, 1),
         )
+
+
+        # self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
+        # self.net = nn.Sequential(
+        #     nn.Linear(args.n_embd + np.prod(env.single_action_space.shape), 256),
+        #     nn.ReLU(),
+        #     nn.Linear(256, 256),
+        #     nn.ReLU(),
+        #     nn.Linear(256, 256),
+        #     nn.ReLU(),
+        #     nn.Linear(256, 1),
+        # )
 
     def forward(self, x, a):                # x = (batch,cont,s_d)   a = (batch,a_d)
         x = self.encoder(x)                 # x = (batch,cont,n_embd)
