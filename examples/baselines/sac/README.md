@@ -1,3 +1,41 @@
+# State-based enviroments:
+
+## PushT (16h on h100)
+
+<img width="308" alt="image" src="https://github.com/user-attachments/assets/49a1133a-06d4-4d31-97c0-e8fdf34ed3d7" />
+
+
+## PickCube (500k steps, 40min on h100)
+
+<img width="300" alt="image" src="https://github.com/user-attachments/assets/a80ea3e1-5a5a-4e66-948c-410bd1b2a2ae" />
+
+## RollBall (8h on h100)
+
+<img width="310" alt="image" src="https://github.com/user-attachments/assets/bb88ed69-2e22-4bfd-9e54-5e9f27641852" />
+
+## StackCube (8h on h100)
+
+<img width="300" alt="image" src="https://github.com/user-attachments/assets/033f3e68-bc79-40b8-a6e7-175388885fb5" />
+
+
+## TwoRobotStackCube (8h on h100)
+
+
+<img width="299" alt="image" src="https://github.com/user-attachments/assets/03fabcde-52e5-4134-9b07-a0db8efa4a9c" />
+
+
+
+
+
+# RGB-based enviroments:
+
+
+
+
+-----
+-----
+-----
+
 # Soft Actor Critic (SAC)
 
 Code for running the SAC RL algorithm is adapted from [CleanRL](https://github.com/vwxyzjn/cleanrl/) and our previous [ManiSkill Baselines](https://github.com/tongzhoumu/ManiSkill_Baselines/). It is written to be single-file and easy to follow/read, and supports state-based RL code.
