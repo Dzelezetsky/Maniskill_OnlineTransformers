@@ -27,80 +27,55 @@ import mani_skill.envs
 
 
 ######### MY CUSTOM TOOLS FOR TRANSFORMER-BASED ONLINE MANISKILL #########
-class ResetTracker:
-    def __init__(self, n_envs, max_steps):
-        self.n_envs = n_envs  # Количество сред
-        self.max_steps = max_steps  # Максимальное количество шагов до удаления индекса
-        self.step_counts = {}  # Хранит шаги после ресета {индекс среды: кол-во шагов}
-
-    def add(self, reset_indices):
-        """Регистрирует сброс для указанных индексов."""
-        for index in reset_indices:
-            if 0 <= index < self.n_envs: 
-                self.step_counts[index] = 1  # Обнуляем счётчик шагов для этих индексов
-            else:
-                print('Error!')    
-
-    def step(self):
-        """Обновляет шаги для всех зарегистрированных индексов и удаляет просроченные."""
-        to_remove = []
-        for index in self.step_counts.keys():
-            self.step_counts[index] += 1
-            if self.step_counts[index] >= self.max_steps: # как только набираем необходимый контекст - удаляем индекс
-                to_remove.append(index)
-        for index in to_remove:
-            del self.step_counts[index]
-
-    def get_info(self, idx):
-        return self.step_counts[idx]
-    
-    
-    def get_active_indices(self):
-        """Потом исп-ть эту ф-ю для нарезки данных. 
-        Т.е. сначала срезаем всё, а затем на основе этих индексов корректируем срез"""
-        return list(self.step_counts.keys())
 
 
-def smart_slice(observations, context, tracker):
-    """Возвращает срез observations с паддингом при недостатке шагов."""
+def smart_slice(observations, context, elapsed_steps, for_rb=True):
     num_envs, seq_len, state_dim = observations.shape
     
     observations2RB = []
     next_observations2RB = []
-
-    if seq_len >= context:
-        for env_index in range(num_envs):
-            if env_index in tracker.step_counts.keys(): # если эта среда нуждается в аккуратном срезе
-                steps_since_reset = tracker.get_info(env_index)  # узнаём сколько шагов простепали после ресета
-                padding_size = context - steps_since_reset       # считаем сколько шагов надо допадить
-                padding = observations[env_index, -steps_since_reset, :].unsqueeze(0).repeat(padding_size, 1) # формируем паддинг
-                valid_states = observations[env_index, -steps_since_reset:, :]
-                next_obs = torch.cat([padding, valid_states], dim=0)  # работает если после ресета прошло мин 2 степа
-                obs = torch.cat([ padding[0].unsqueeze(0), padding, valid_states[:-1,:] ], dim=0)# работает если после ресета прошло мин 2 степа
-                next_observations2RB.append(next_obs)
-                observations2RB.append(obs)
-            elif env_index not in tracker.step_counts.keys():
-                next_obs = observations[env_index, -context:, :] # всегда cont, s_d
-                obs = torch.cat([ next_obs[0,:].unsqueeze(0), next_obs[:-1,:] ])   # а точно ли я должен next_obs[0,:] добавлять или надо просто другой срез сделать? 
-                next_observations2RB.append(next_obs)
-                observations2RB.append(obs)
-        
-        return torch.stack(observations2RB), torch.stack(next_observations2RB)    
     
-    else:                
-        padding_size = context - seq_len
-        padding = observations[:, 0, :].unsqueeze(1).repeat(1, padding_size, 1)  # паддинг первым состоянием
-
+    if for_rb: # если режем для rb
+        for env_index in range(num_envs): # пробегаем по средам
+            
+            steps_since_reset = elapsed_steps[env_index]
+            if steps_since_reset >= context:  # этого условия достаточно что бы без пад-гов сделать s и s'
+                obs = observations[env_index, -context-1:-1, :]
+                next_obs = observations[env_index, -context:, :]
+            
+            elif 0 < steps_since_reset < context:                
+                padding_size = context - steps_since_reset 
+                padding = observations[env_index, -steps_since_reset-1, :].unsqueeze(0).repeat(padding_size, 1) 
+                valid_states = observations[env_index, -steps_since_reset-1:, :]
+                intermediate_obs = torch.cat([padding, valid_states], dim=0) 
+                obs = intermediate_obs[env_index, -context-1:-1, :]
+                next_obs = intermediate_obs[env_index, -context:, :]
+            
+            elif  steps_since_reset == 0:  # это обманка, на самом деле мы не начали с нового сост-я а видим 51й кадр
+                obs = observations[env_index, -context-1:-1, :]
+                next_obs = observations[env_index, -context:, :]
+                
+            observations2RB.append(obs)
+            next_observations2RB.append(next_obs)  
+            
+        return torch.stack(observations2RB), torch.stack(next_observations2RB)
+                
+    if not for_rb:
+        for env_index in range(num_envs): # пробегаем по средам
+            
+            steps_since_reset = elapsed_steps[env_index]
+            if steps_since_reset >= context-1:                  # самый позитивый сценарий, просто нарезаем и не паримся
+                next_obs = observations[env_index, -context:, :]
+                
+            elif steps_since_reset < context-1: 
+                padding_size = context - steps_since_reset - 1
+                padding = observations[env_index, -steps_since_reset-1, :].unsqueeze(0).repeat(padding_size, 1)
+                valid_states = observations[env_index, -steps_since_reset-1:, :]
+                next_obs = torch.cat([padding, valid_states], dim=0)
+             
+            next_observations2RB.append(next_obs)
         
-        next_obs = torch.cat([padding, observations], dim=1)
-
-        obs = torch.cat([
-                observations[:, 0, :].unsqueeze(1),  # начальное состояние
-                padding,
-                observations[:,:-1, :]
-            ], dim=1)
-
-    return obs, next_obs
+        return torch.stack(next_observations2RB)
 
 
 
@@ -862,7 +837,7 @@ if __name__ == "__main__":
             if global_observations.shape[1] > args.seq_len:
                 global_observations = global_observations[:, -args.seq_len-1:,]
             
-            obs2act = smart_slice(global_observations, args.seq_len, info['elapsed_steps'])[1]  #elapsed_steps = tensor([n, n, n, n,  n])
+            obs2act = smart_slice(global_observations, args.seq_len, info['elapsed_steps'].tolist(), for_rb = False)  #elapsed_steps = tensor([n, n, n, n,  n])
             
             if not learning_has_started:
                 actions = torch.tensor(envs.action_space.sample(), dtype=torch.float32, device=device)
@@ -873,7 +848,7 @@ if __name__ == "__main__":
             
             
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, rewards, terminations, truncations, infos = envs.step(actions)  #elapsed_steps = tensor([n+1, n+1, n+1, n+1, n+1])
+            next_obs, rewards, terminations, truncations, infos = envs.step(actions)  #elapsed_steps = tensor([n, 0, s, 0, m])
             
             global_observations = torch.cat([global_observations, next_obs.unsqueeze(1)], dim=1)
             
@@ -884,7 +859,7 @@ if __name__ == "__main__":
                 stop_bootstrap = truncations | terminations # always stop bootstrap when episode ends
             else:
                 if args.bootstrap_at_done == 'always':
-                    need_final_obs = truncations | terminations # always need final obs when episode ends
+                    need_final_obs = truncations | terminations # true everwhere 
                     stop_bootstrap = torch.zeros_like(terminations, dtype=torch.bool) # never stop bootstrap
                 else: # bootstrap at truncated
                     need_final_obs = truncations & (~terminations) # only need final obs when truncated and not terminated
@@ -896,11 +871,15 @@ if __name__ == "__main__":
                 for k, v in final_info["episode"].items():
                     logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
             
+            '''
+            real_next_obs содержат 51 степ
+            next_obs не содержат 51 степ
+            '''
                    
             real_global_observations = global_observations.clone()
             real_global_observations[:,-1,:] = real_next_obs
             
-            obs2RB, n_obs2RB = smart_slice(real_global_observations, args.seq_len, infos['elapsed_steps']) #infos['elapsed_steps'] = tensor([1, 1, 1, 1, 1])
+            obs2RB, n_obs2RB = smart_slice(real_global_observations, args.seq_len, infos['elapsed_steps'].tolist(), for_rb=True) #elapsed_steps = tensor([n, 0, s, 0, m])
             
             
             rb.add(obs2RB, n_obs2RB, actions, rewards, stop_bootstrap)   # RB* <-- (ne,cont,sd), (ne,cont,sd), (ne,ad), (ne), (ne) 
@@ -908,8 +887,8 @@ if __name__ == "__main__":
             
             if 'episode' in infos and infos['episode']['success_once'].any():
                 success_indices = torch.where(infos['episode']['success_once'])[0].tolist() # выводим индексы тех сред где случился success
-                reseted_obs, _ = envs.reset(options={"env_idx":success_indices}) # обновляем только те среды, в который словили sr_once. при этом остальныве среды остаются неизменными
-                tracker.add(success_indices)
+                reseted_obs, infos = envs.reset(options={"env_idx":success_indices}) # обновляем только те среды, в который словили sr_once. при этом остальныве среды остаются неизменными
+                #tracker.add(success_indices)
                 global_observations[:,-1,:] = reseted_obs
                
 
