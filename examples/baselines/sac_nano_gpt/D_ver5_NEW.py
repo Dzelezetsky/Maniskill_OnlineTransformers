@@ -48,8 +48,8 @@ def smart_slice(observations, context, elapsed_steps, for_rb=True):
                 padding = observations[env_index, -steps_since_reset-1, :].unsqueeze(0).repeat(padding_size, 1) 
                 valid_states = observations[env_index, -steps_since_reset-1:, :]
                 intermediate_obs = torch.cat([padding, valid_states], dim=0) 
-                obs = intermediate_obs[env_index, -context-1:-1, :]
-                next_obs = intermediate_obs[env_index, -context:, :]
+                obs = intermediate_obs[ -context-1:-1, :]
+                next_obs = intermediate_obs[ -context:, :]
             
             elif  steps_since_reset == 0:  # это обманка, на самом деле мы не начали с нового сост-я а видим 51й кадр
                 obs = observations[env_index, -context-1:-1, :]
@@ -760,7 +760,6 @@ if __name__ == "__main__":
 
     
     
-    tracker = ResetTracker(n_envs=args.num_envs, max_steps=args.seq_len)
     global_observations = torch.empty((args.num_envs, 0, envs.single_observation_space.shape[0])).to(device)   #n_e, 0, s_d
     global_observations = torch.cat([global_observations, obs.unsqueeze(1)], dim=1)
     
@@ -888,7 +887,6 @@ if __name__ == "__main__":
             if 'episode' in infos and infos['episode']['success_once'].any():
                 success_indices = torch.where(infos['episode']['success_once'])[0].tolist() # выводим индексы тех сред где случился success
                 reseted_obs, infos = envs.reset(options={"env_idx":success_indices}) # обновляем только те среды, в который словили sr_once. при этом остальныве среды остаются неизменными
-                #tracker.add(success_indices)
                 global_observations[:,-1,:] = reseted_obs
                
 
