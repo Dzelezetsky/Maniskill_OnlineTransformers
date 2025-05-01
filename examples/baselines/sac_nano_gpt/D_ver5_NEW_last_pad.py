@@ -7,6 +7,8 @@ import time
 from typing import Optional
 import math
 import tqdm
+import json
+
 
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
@@ -760,7 +762,8 @@ if __name__ == "__main__":
     
     
     global_observations = torch.empty((args.num_envs, 0, envs.single_observation_space.shape[0])).to(device)   #n_e, 0, s_d
-    global_observations = torch.cat([global_observations, obs.unsqueeze(1)], dim=1)
+    #print(global_observations.shape, obs.shape)
+    #global_observations = torch.cat([global_observations, obs.unsqueeze(1)], dim=1)
     
     while global_step < args.total_timesteps:
         
@@ -770,6 +773,8 @@ if __name__ == "__main__":
         
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # evaluate
+            #rew_list = []
+            
             actor.eval()
             stime = time.perf_counter()
             
@@ -788,7 +793,7 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(actor.get_eval_action(eval_observations))
                     eval_observations = torch.cat([eval_observations, eval_obs.unsqueeze(1)], dim=1)
-                    
+                    #rew_list.append(eval_rew.cpu().numpy().tolist())
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -809,7 +814,10 @@ if __name__ == "__main__":
                 cumulative_times["eval_time"] += eval_time
                 logger.add_scalar("time/eval_time", eval_time, global_step)
             if args.evaluate:
+                # with open('clear_pad.json', 'w') as f:
+                #     json.dump(rew_list, f)
                 break
+                
             actor.train()
 
             # if args.save_model:
