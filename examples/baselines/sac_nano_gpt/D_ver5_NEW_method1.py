@@ -664,7 +664,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs           #64/32=2
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"[NO_SLICE_AT_ALL]{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"[+NO_SLICE_AT_ALL+]{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
@@ -852,6 +852,9 @@ if __name__ == "__main__":
         
         # Collect samples from environemnts
         rollout_time = time.perf_counter()
+        global_observations = torch.empty((args.num_envs, 0, envs.single_observation_space.shape[0])).to(device)   #n_e, 0, s_d
+        global_observations = torch.cat([global_observations, obs.unsqueeze(1)], dim=1)
+        
         for local_step in range(args.steps_per_env):
             global_step += 1 * args.num_envs
             
@@ -900,7 +903,7 @@ if __name__ == "__main__":
             obs2RB = real_global_observations[:, -args.seq_len-1:-1, ]
             n_obs2RB = real_global_observations[:, -args.seq_len:, ]
             
-            if global_step > args.seq_len* args.num_envs:
+            if local_step > 10:
                 rb.add(obs2RB, n_obs2RB, actions, rewards, stop_bootstrap)   # RB* <-- (ne,cont,sd), (ne,cont,sd), (ne,ad), (ne), (ne) 
             
             
