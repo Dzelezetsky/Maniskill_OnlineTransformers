@@ -773,7 +773,7 @@ if __name__ == "__main__":
         
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # evaluate
-            #rew_list = []
+            rew_list = []
             
             actor.eval()
             stime = time.perf_counter()
@@ -793,7 +793,7 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(actor.get_eval_action(eval_observations))
                     eval_observations = torch.cat([eval_observations, eval_obs.unsqueeze(1)], dim=1)
-                    #rew_list.append(eval_rew.cpu().numpy().tolist())
+                    rew_list.append(eval_rew.cpu().numpy().tolist())
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -814,8 +814,8 @@ if __name__ == "__main__":
                 cumulative_times["eval_time"] += eval_time
                 logger.add_scalar("time/eval_time", eval_time, global_step)
             if args.evaluate:
-                # with open('clear_pad.json', 'w') as f:
-                #     json.dump(rew_list, f)
+                with open('no_pad.json', 'w') as f:
+                    json.dump(rew_list, f)
                 break
                 
             actor.train()
