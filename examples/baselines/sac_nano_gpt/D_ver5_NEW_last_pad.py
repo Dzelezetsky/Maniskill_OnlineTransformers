@@ -37,10 +37,10 @@ def smart_slice(observations, context, elapsed_steps, for_rb=True):
     observations2RB = []
     next_observations2RB = []
     
-    if for_rb: # если режем для rb
+    if for_rb: # если режем для rb (готовим и obs и next_obs)
         for env_index in range(num_envs): # пробегаем по средам
             
-            steps_since_reset = elapsed_steps[env_index]
+            steps_since_reset = elapsed_steps[env_index] # сколько шагов настепали с последнего ресета 
             if steps_since_reset >= context:  # этого условия достаточно что бы без пад-гов сделать s и s'
                 obs = observations[env_index, -context-1:-1, :]
                 next_obs = observations[env_index, -context:, :]
@@ -63,9 +63,15 @@ def smart_slice(observations, context, elapsed_steps, for_rb=True):
         return torch.stack(observations2RB), torch.stack(next_observations2RB)
                 
     if not for_rb:
+        '''
+        Значит мы на этапе беганья по среде (TRAIN)
+        
+        если elapsed steps среды =0, то значит среда только что ресетнулась, мы видим первый стетйт но действией еще не делали 
+        '''
+        
         for env_index in range(num_envs): # пробегаем по средам
             
-            steps_since_reset = elapsed_steps[env_index]
+            steps_since_reset = elapsed_steps[env_index]  # м.б. =0,1,2....
             if steps_since_reset >= context-1:                  # самый позитивый сценарий, просто нарезаем и не паримся
                 next_obs = observations[env_index, -context:, :]
                 
@@ -74,7 +80,13 @@ def smart_slice(observations, context, elapsed_steps, for_rb=True):
                 padding = observations[env_index, -steps_since_reset-1, :].unsqueeze(0).repeat(padding_size, 1)
                 valid_states = observations[env_index, -steps_since_reset-1:, :]
                 next_obs = torch.cat([padding, valid_states], dim=0)
-             
+            
+            # elif steps_since_reset == 0: # это я добавил недавно: случай когда мы только ресетнули среду
+            #     padding_size = context - 1 # т.е. допаживаем оставшийся контекст просто тем самым нулевым стейтом коорый у нас есть
+            #     padding = observations[env_index, -1, :].unsqueeze(0).repeat(padding_size, 1)  # берём текущее состояние и просто его растягиваем 
+            #     valid_states = observations[env_index, -1, :] # одно валидное состояние, которое есть сейчас (тот самый первый степ)
+            #     next_obs = torch.cat([padding, valid_states], dim=0)
+                
             next_observations2RB.append(next_obs)
         
         return torch.stack(next_observations2RB)
@@ -571,58 +583,58 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
 
-class MLP_Actor(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(np.array(env.single_observation_space.shape).prod(), 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-        )
-        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
-        # action rescaling
-        h, l = env.single_action_space.high, env.single_action_space.low
-        self.register_buffer("action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32))
-        self.register_buffer("action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32))
-        # will be saved in the state_dict
+# class MLP_Actor(nn.Module):
+#     def __init__(self, env):
+#         super().__init__()
+#         self.backbone = nn.Sequential(
+#             nn.Linear(np.array(env.single_observation_space.shape).prod(), 256),
+#             nn.ReLU(),
+#             nn.Linear(256, 256),
+#             nn.ReLU(),
+#             nn.Linear(256, 256),
+#             nn.ReLU(),
+#         )
+#         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
+#         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+#         # action rescaling
+#         h, l = env.single_action_space.high, env.single_action_space.low
+#         self.register_buffer("action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32))
+#         self.register_buffer("action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32))
+#         # will be saved in the state_dict
 
-    def forward(self, x):
-        x = self.backbone(x)
-        mean = self.fc_mean(x)
-        log_std = self.fc_logstd(x)
-        log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+#     def forward(self, x):
+#         x = self.backbone(x)
+#         mean = self.fc_mean(x)
+#         log_std = self.fc_logstd(x)
+#         log_std = torch.tanh(log_std)
+#         log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
 
-        return mean, log_std
+#         return mean, log_std
 
-    def get_eval_action(self, x):
-        x = self.backbone(x)
-        mean = self.fc_mean(x)
-        action = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action
+#     def get_eval_action(self, x):
+#         x = self.backbone(x)
+#         mean = self.fc_mean(x)
+#         action = torch.tanh(mean) * self.action_scale + self.action_bias
+#         return action
 
-    def get_action(self, x):
-        mean, log_std = self(x)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
-        # Enforcing Action Bound
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean
+#     def get_action(self, x):
+#         mean, log_std = self(x)
+#         std = log_std.exp()
+#         normal = torch.distributions.Normal(mean, std)
+#         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+#         y_t = torch.tanh(x_t)
+#         action = y_t * self.action_scale + self.action_bias
+#         log_prob = normal.log_prob(x_t)
+#         # Enforcing Action Bound
+#         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+#         log_prob = log_prob.sum(1, keepdim=True)
+#         mean = torch.tanh(mean) * self.action_scale + self.action_bias
+#         return action, log_prob, mean
 
-    def to(self, device):
-        self.action_scale = self.action_scale.to(device)
-        self.action_bias = self.action_bias.to(device)
-        return super().to(device)
+#     def to(self, device):
+#         self.action_scale = self.action_scale.to(device)
+#         self.action_bias = self.action_bias.to(device)
+#         return super().to(device)
 
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
@@ -763,7 +775,7 @@ if __name__ == "__main__":
     
     global_observations = torch.empty((args.num_envs, 0, envs.single_observation_space.shape[0])).to(device)   #n_e, 0, s_d
     #print(global_observations.shape, obs.shape)
-    #global_observations = torch.cat([global_observations, obs.unsqueeze(1)], dim=1)
+    global_observations = torch.cat([global_observations, obs.unsqueeze(1)], dim=1)
     
     while global_step < args.total_timesteps:
         
@@ -843,6 +855,7 @@ if __name__ == "__main__":
             if global_observations.shape[1] > args.seq_len:
                 global_observations = global_observations[:, -args.seq_len-1:,]
             
+            #print(f"local_step {local_step} out of {args.steps_per_env}")
             obs2act = smart_slice(global_observations, args.seq_len, info['elapsed_steps'].tolist(), for_rb = False)  #elapsed_steps = tensor([n, n, n, n,  n])
             
             if not learning_has_started:
