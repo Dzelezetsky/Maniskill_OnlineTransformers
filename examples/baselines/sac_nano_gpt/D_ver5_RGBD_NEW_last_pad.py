@@ -195,7 +195,7 @@ class Args:
     """the discount factor gamma"""
     tau: float = 0.01
     """target smoothing coefficient"""
-    batch_size: int = 820 #1024
+    batch_size: int = 1024 #820
     """the batch size of sample from the replay memory"""
     learning_starts: int = 4_000
     """timestep to start learning"""
@@ -235,12 +235,12 @@ class Args:
     
     use_gates: bool = False
     """use gatings instead skip connection in transformer block"""
-    n_embd: int = 227#256
+    n_embd: int = 227  #483#256  
     """inner transformer dimention"""
     n_layer: int = 1
     n_head: int = 2
     dropout: float = 0.0
-    seq_len: int = 10
+    seq_len: int = 5
     bias: bool = True
     
 class DictArray(object):
@@ -813,7 +813,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs           #64/32=2
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"[LAST_PAD]{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"[FROM_SCRATCH]{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
@@ -862,6 +862,7 @@ if __name__ == "__main__":
     
     print(f"partial_reset {args.partial_reset}")
     print(f"eval partial_reset {args.eval_partial_reset}")
+    print(f"num_envs {args.num_envs}")
     
     if not args.evaluate:
         print("Running training")
@@ -911,6 +912,7 @@ if __name__ == "__main__":
     qf1_target = SoftQNetwork(envs, args, actor.encoder).to(device)
     qf2_target = SoftQNetwork(envs, args, actor.encoder).to(device)
     if args.checkpoint is not None:
+        print('Downloading checkpoint!')
         ckpt = torch.load(args.checkpoint)
         actor.load_state_dict(ckpt['actor'])
         qf1.load_state_dict(ckpt['qf1'])
@@ -1018,15 +1020,15 @@ if __name__ == "__main__":
                 
             actor.train()
 
-            # if args.save_model:
-            #     model_path = f"runs/{run_name}/ckpt_{global_step}.pt"
-            #     torch.save({
-            #         'actor': actor.state_dict(),
-            #         'qf1': qf1_target.state_dict(),
-            #         'qf2': qf2_target.state_dict(),
-            #         'log_alpha': log_alpha,
-            #     }, model_path)
-            #     print(f"model saved to {model_path}")
+            if args.save_model:
+                model_path = f"runs/{run_name}/ckpt_{global_step}.pt"
+                torch.save({
+                    'actor': actor.state_dict(),
+                    'qf1': qf1_target.state_dict(),
+                    'qf2': qf2_target.state_dict(),
+                    'log_alpha': log_alpha,
+                }, model_path)
+                print(f"model saved to {model_path}")
 
         
 #↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
