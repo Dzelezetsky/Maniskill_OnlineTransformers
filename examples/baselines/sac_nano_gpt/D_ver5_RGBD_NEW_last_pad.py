@@ -813,7 +813,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs           #64/32=2
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"[FROM_SCRATCH]{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"RGB/[FROM_SCRATCH]{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
