@@ -1,4 +1,5 @@
 
+
 from collections import defaultdict
 from dataclasses import dataclass
 import os
@@ -101,7 +102,7 @@ class Args:
     """the discount factor gamma"""
     tau: float = 0.01
     """target smoothing coefficient"""
-    batch_size: int = 700
+    batch_size: int = 512
     """the batch size of sample from the replay memory"""
     learning_starts: int = 4_000
     """timestep to start learning"""
@@ -383,18 +384,15 @@ class SoftQNetwork(nn.Module):
         super().__init__()
         self.encoder = encoder
         action_dim = np.prod(envs.single_action_space.shape)
-        self.state_dim = envs.single_observation_space['state'].shape[0] if 'state' in envs.single_observation_space else 0
-        self.mlp = make_mlp(encoder.encoder.out_dim+action_dim+self.state_dim, [512, 256, 1], last_act=False)
+        state_dim = envs.single_observation_space['state'].shape[0]
+        self.mlp = make_mlp(encoder.encoder.out_dim+action_dim+state_dim, [512, 256, 1], last_act=False)
 
     def forward(self, obs, action, visual_feature=None, detach_encoder=False):
         if visual_feature is None:
             visual_feature = self.encoder(obs)
         if detach_encoder:
             visual_feature = visual_feature.detach()
-        if self.state_dim != 0:
-            x = torch.cat([visual_feature, obs["state"], action], dim=1)
-        else:
-            x = torch.cat([visual_feature, action], dim=1)
+        x = torch.cat([visual_feature, obs["state"], action], dim=1)
         return self.mlp(x)
 
 
@@ -405,7 +403,7 @@ class Actor(nn.Module):
     def __init__(self, envs, sample_obs):
         super().__init__()
         action_dim = np.prod(envs.single_action_space.shape)
-        self.state_dim = envs.single_observation_space['state'].shape[0] if 'state' in envs.single_observation_space else 0
+        state_dim = envs.single_observation_space['state'].shape[0]
         # count number of channels and image size
         in_channels = 0
         if "rgb" in sample_obs:
@@ -418,7 +416,7 @@ class Actor(nn.Module):
         self.encoder = EncoderObsWrapper(
             PlainConv(in_channels=in_channels, out_dim=256, image_size=image_size) # assume image is 64x64
         )
-        self.mlp = make_mlp(self.encoder.encoder.out_dim+self.state_dim, [512, 256], last_act=True)
+        self.mlp = make_mlp(self.encoder.encoder.out_dim+state_dim, [512, 256], last_act=True)
         self.fc_mean = nn.Linear(256, action_dim)
         self.fc_logstd = nn.Linear(256, action_dim)
         # action rescaling
@@ -429,10 +427,7 @@ class Actor(nn.Module):
         visual_feature = self.encoder(obs)
         if detach_encoder:
             visual_feature = visual_feature.detach()
-        if self.state_dim != 0:
-            x = torch.cat([visual_feature, obs['state']], dim=1)
-        else:
-            x = visual_feature
+        x = torch.cat([visual_feature, obs['state']], dim=1)
         return self.mlp(x), visual_feature
 
     def forward(self, obs, detach_encoder=False):
@@ -485,7 +480,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"MLP_RGBD_ACCELERATOR/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 

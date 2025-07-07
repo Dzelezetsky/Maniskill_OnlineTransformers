@@ -21,12 +21,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+#import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 import tyro
 
 import mani_skill.envs
 
 
+# def setup_distributed():
+#     dist.init_process_group(backend="nccl")
+#     local_rank = int(os.environ["LOCAL_RANK"])
+#     torch.cuda.set_device(local_rank)
+#     return local_rank
 
 ######### MY CUSTOM TOOLS FOR TRANSFORMER-BASED ONLINE MANISKILL #########
 
@@ -713,9 +719,9 @@ class Actor(nn.Module):
         #print(f"x before cat with state {visual_feature.shape}")
         if detach_encoder:
             visual_feature = visual_feature.detach()
-        x = torch.cat([visual_feature, obs['state']], dim=-1)
+        x = torch.cat([visual_feature, obs['state']], dim=-1) # bs, ne, cont, hidden
         #print(f"x after cat with state {x.shape}")
-    
+        print(x.shape)
         return self.transformer(x)[:,-1,:], visual_feature
     
     def forward(self, obs, detach_encoder=False):
@@ -729,6 +735,8 @@ class Actor(nn.Module):
 
     def get_eval_action(self, obs):
         mean, log_std, _ = self(obs)
+        self.action_scale = self.action_scale.to(mean.device)
+        self.action_bias = self.action_bias.to(mean.device)
         action = torch.tanh(mean) * self.action_scale + self.action_bias
         return action
 
@@ -750,6 +758,7 @@ class Actor(nn.Module):
         self.action_scale = self.action_scale.to(device)
         self.action_bias = self.action_bias.to(device)
         return super().to(device)
+    
 
 
 class SoftQNetwork(nn.Module):
@@ -808,6 +817,13 @@ class Logger:
         self.writer.close()
 
 if __name__ == "__main__":
+    
+    #local_rank = setup_distributed()
+    
+    print("Using", torch.cuda.device_count(), "GPUs:")
+    for i in range(torch.cuda.device_count()):
+        print(f"  cuda:{i} — {torch.cuda.get_device_name(i)}")
+    
     args = tyro.cli(Args)
     args.grad_steps_per_iteration = int(args.training_freq * args.utd) #32
     args.steps_per_env = args.training_freq // args.num_envs           #64/32=2
@@ -823,6 +839,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
+    
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     ####### Environment setup #######
     env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend="gpu", sensor_configs=dict())
@@ -909,24 +926,33 @@ if __name__ == "__main__":
     actor = Actor(envs, args, sample_obs=obs).to(device)
     qf1 = SoftQNetwork(envs, args, actor.encoder).to(device)
     qf2 = SoftQNetwork(envs, args, actor.encoder).to(device)
+    
+    # if args.distributed:
+    #     actor = torch.nn.parallel.DistributedDataParallel(actor, device_ids=[local_rank])
+    #     qf1 = torch.nn.parallel.DistributedDataParallel(qf1, device_ids=[local_rank])
+    #     qf2 = torch.nn.parallel.DistributedDataParallel(qf2, device_ids=[local_rank])
+    
     qf1_target = SoftQNetwork(envs, args, actor.encoder).to(device)
     qf2_target = SoftQNetwork(envs, args, actor.encoder).to(device)
+    
     if args.checkpoint is not None:
         print('Downloading checkpoint!')
         ckpt = torch.load(args.checkpoint)
         actor.load_state_dict(ckpt['actor'])
         qf1.load_state_dict(ckpt['qf1'])
         qf2.load_state_dict(ckpt['qf2'])
-    qf1_target.load_state_dict(qf1.state_dict())
-    qf2_target.load_state_dict(qf2.state_dict())
+        qf1_target.load_state_dict(qf1.state_dict())
+        qf2_target.load_state_dict(qf2.state_dict())
+    
     q_optimizer = optim.Adam(
-        list(qf1.transformer.parameters()) +
-        list(qf2.transformer.parameters()) +
-        list(qf1.net.parameters()) +
-        list(qf2.net.parameters()) +
-        list(qf1.encoder.parameters()),
-        lr=args.q_lr)
+                    list(qf1.transformer.parameters()) +
+                    list(qf2.transformer.parameters()) +
+                    list(qf1.net.parameters()) +
+                    list(qf2.net.parameters()) +
+                    list(qf1.encoder.parameters()),
+                    lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    
 
     # Automatic entropy tuning
     if args.autotune:
@@ -1135,7 +1161,7 @@ if __name__ == "__main__":
             
             
 
-            # update the value networks
+            # update the value networks 
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _, visual_feature = actor.get_action(data.next_obs)
                 qf1_next_target = qf1_target(data.next_obs, next_state_actions, visual_feature)
@@ -1152,7 +1178,7 @@ if __name__ == "__main__":
 
             q_optimizer.zero_grad()
             qf_loss.backward()
-            q_optimizer.step()
+            q_optimizer.step()   
 
             # update the policy network
             if global_update % args.policy_frequency == 0:  # TD 3 Delayed update support
@@ -1167,8 +1193,8 @@ if __name__ == "__main__":
                 actor_optimizer.step()
 
                 if args.autotune:
-                    with torch.no_grad():
-                        _, log_pi, _, _ = actor.get_action(data.obs)
+                    with torch.no_grad(): 
+                        _, log_pi, _, _ =  actor.get_action(data.obs)
                     # if args.correct_alpha:
                     alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
                     # else:
@@ -1182,6 +1208,7 @@ if __name__ == "__main__":
 
             # update the target networks
             if global_update % args.target_network_frequency == 0:
+                
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):

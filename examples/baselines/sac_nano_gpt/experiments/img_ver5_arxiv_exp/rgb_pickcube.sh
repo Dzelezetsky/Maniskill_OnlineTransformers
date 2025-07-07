@@ -6,7 +6,7 @@
 
 CUDA_DEV=$1
 
-seed=(3)
+seed=(4)
 
 for seed in ${seed[@]}
 do
