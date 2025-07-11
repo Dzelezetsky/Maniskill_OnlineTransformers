@@ -13,7 +13,7 @@ from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, FlattenRGBDObservationWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-
+import time
 import gymnasium as gym
 import numpy as np
 import torch
@@ -143,7 +143,7 @@ class Args:
     
     use_gates: bool = False
     """use gatings instead skip connection in transformer block"""
-    n_embd: int = 227  #483#256  
+    n_embd: int = 228  #483#256  
     """inner transformer dimention"""
     n_layer: int = 1
     n_head: int = 2
@@ -299,33 +299,65 @@ class ReplayBuffer:
         self.V = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
 
 
-    def add_associated_reward(self, positions, rewards):
-        rewards = rewards.unsqueeze(0).repeat(len(positions), 1)   #n_e -> len(positions), n_e
-        self.associated_r[[positions]] += rewards
+    def add_associated_reward(self, positions: list[int], rewards: torch.Tensor):
+        """
+        Добавляет к associated_r для каждого шага в positions соответствующее `rewards`.
+        Умеет работать с любым порядком позиций, в том числе с переходом через конец буфера.
+        """
+        if len(positions) == 0:
+            return
+
+        # приводим к тензору нужного устройства
+        pos = torch.tensor(positions, dtype=torch.long, device=self.storage_device)  # [T]
+        # rewards: [N] -> [T, N]
+        R = rewards.unsqueeze(0).expand(len(positions), -1)
+
+        # аккуратно добавляем
+        # self.associated_r.shape == [buffer_len, num_envs]
+        self.associated_r[pos, :] += R
         
     def add_qv_estimates(self, positions: list[int]):
         """
-        Использует associated_r и rewards для вычисления Q(s,a) и V(s)
+        Использует associated_r и rewards для вычисления Q(s,a) и V(s) для каждого шага в positions.
+        Позиции могут «обходить» конец буфера; мы сначала перестроим их в хронологическом порядке,
+        потом посчитаем кумулятивные суммы и запишем Q/V обратно в оригинальные слоты.
         """
-        pos = torch.tensor(positions)  # [T]
-        env_ids = torch.arange(self.num_envs)  # [N]
-        ti, ei = torch.meshgrid(pos, env_ids, indexing="ij")  # [T, N]
+        if not positions:
+            return
 
-        # [T, N]
-        rewards = self.rewards[ti, ei]
-        associated_r = self.associated_r[ti, ei]
+        # Находим точку «склейки» — где идёт спад индексов
+        split_idx = None
+        for i in range(len(positions) - 1):
+            if positions[i] > positions[i + 1]:
+                split_idx = i + 1
+                break
 
-        # Cumulative sum по временной оси (dim=0), но без включения текущего шага для Q
-        # → Q = R - cumsum без текущего
-        # → V = R - cumsum включая текущий
-        cum_rewards_exclusive = torch.cumsum(rewards, dim=0) - rewards  # [T, N]
-        cum_rewards_inclusive = torch.cumsum(rewards, dim=0)  # [T, N]
+        if split_idx is None:
+            ordered = positions[:]            # уже упорядочено
+        else:
+            # переставим хвост вперёд
+            ordered = positions[split_idx:] + positions[:split_idx]
 
-        q_values = associated_r - cum_rewards_exclusive
-        v_values = associated_r - cum_rewards_inclusive
+        # тензоры для индексов
+        pos = torch.tensor(ordered, dtype=torch.long, device=self.storage_device)  # [T]
+        envs = torch.arange(self.num_envs, device=self.storage_device)            # [N]
+        ti, ei = torch.meshgrid(pos, envs, indexing="ij")                         # [T, N]
 
-        self.Q[ti, ei] = q_values
-        self.V[ti, ei] = v_values
+        # достаём соответствующие матрицы
+        R = self.rewards[ti, ei]         # [T, N]
+        A = self.associated_r[ti, ei]    # [T, N]
+
+        # Q = A − cumsum(R) без текущего, V = A − cumsum(R) с текущим
+        cum_excl = torch.cumsum(R, dim=0) - R   # [T, N]
+        cum_incl = torch.cumsum(R, dim=0)       # [T, N]
+
+        Q_vals = A - cum_excl
+        V_vals = A - cum_incl
+
+        # Записываем обратно в буфер, сопоставляя в том же порядке `ordered`
+        # self.Q.shape == [buffer_len, num_envs]
+        self.Q[pos, :] = Q_vals
+        self.V[pos, :] = V_vals
     
         
     
@@ -370,95 +402,194 @@ class ReplayBuffer:
             rewards=self.rewards[batch_inds, env_inds].to(self.sample_device),
             dones=self.dones[batch_inds, env_inds].to(self.sample_device)
         )
-        
-    def sample_for_trans(self, positions: list):    
-        positions = torch.tensor(positions)  # T
-        env_ids = torch.arange(self.num_envs)  # N
-        ti, ei = torch.meshgrid(positions, env_ids, indexing="ij")  # T, N
+      
+      
+      
+    def make_sequential_dataloader(self,
+                               positions: list[int],
+                               context_len: int,
+                               batch_size: int,
+                               shuffle: bool = True):
+        if not positions:
+            raise ValueError("Positions list is empty.")
 
-        obs_batch = self.obs[ti, ei]
-        next_obs_batch = self.next_obs[ti, ei]
-        actions_batch = self.actions[ti, ei]
-        rewards_batch = self.rewards[ti, ei]
-        dones_batch = self.dones[ti, ei]
+        # 1) Найти, есть ли «склейка» (wrap-around) в списке позиций
+        split_idx = None
+        for i in range(len(positions) - 1):
+            if positions[i] > positions[i + 1]:
+                split_idx = i + 1
+                break
 
-        obs_batch = {k: v.to(self.sample_device) for k, v in obs_batch.items()}
-        next_obs_batch = {k: v.to(self.sample_device) for k, v in next_obs_batch.items()}
+        # 2) Перестроить список в хронологическом порядке
+        if split_idx is not None:
+            ordered = positions[split_idx:] + positions[:split_idx]
+        else:
+            ordered = positions[:]
 
-        return ReplayBufferSample(
-            obs=obs_batch,
-            next_obs=next_obs_batch,
-            actions=actions_batch.to(self.sample_device),
-            rewards=rewards_batch.to(self.sample_device),
-            dones=dones_batch.to(self.sample_device),
-        )
-        
-    def make_sequential_dataloader(self, positions: list[int], context_len: int, batch_size: int, shuffle: bool = True):
-        pos = torch.tensor(positions)
+        # 3) Собираем индексы по времени и окружениям
+        pos = torch.tensor(ordered, dtype=torch.long, device=self.storage_device)  # [T]
         num_steps = len(pos)
         n_envs = self.num_envs
-        device = self.sample_device   
-        
-        time_idx, env_idx = torch.meshgrid(pos, torch.arange(n_envs), indexing="ij")
-        
-        obs = self.obs[time_idx, env_idx]
-        next_obs = self.next_obs[time_idx, env_idx]
-        actions = self.actions[time_idx, env_idx]
-        rewards = self.rewards[time_idx, env_idx]
-        dones = self.dones[time_idx, env_idx]
-        associated_r = self.associated_r[time_idx, env_idx]
-        q_vals = self.Q[time_idx, env_idx]
-        v_vals = self.V[time_idx, env_idx]
+        device = self.sample_device
 
+        time_idx, env_idx = torch.meshgrid(
+            pos,
+            torch.arange(n_envs, device=self.storage_device),
+            indexing="ij"
+        )  # оба [T, N]
+
+        # 4) Выдёргиваем всё из кольцевого буфера
+        obs          = self.obs[time_idx, env_idx]
+        next_obs     = self.next_obs[time_idx, env_idx]
+        actions      = self.actions[time_idx, env_idx]
+        rewards      = self.rewards[time_idx, env_idx]
+        dones        = self.dones[time_idx, env_idx]
+        associated_r = self.associated_r[time_idx, env_idx]
+        q_vals       = self.Q[time_idx, env_idx]
+        v_vals       = self.V[time_idx, env_idx]
+
+        # 5) Формируем скользящие окна длины context_len
         sequences = []
         for start in range(num_steps - context_len + 1):
             end = start + context_len
 
-            # Собираем последовательности: [context_len, n_envs, ...] → [n_envs, context_len, ...]
-            obs_seq = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim)) for k, v in obs.items()}
-            next_obs_seq = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim)) for k, v in next_obs.items()}
-            actions_seq = actions[start:end].to(device).permute(1, 0, *range(2, actions.ndim))
-            rewards_seq = rewards[start:end].to(device).permute(1, 0)
-            dones_seq = dones[start:end].to(device).permute(1, 0)
-            associated_r_seq = associated_r[start:end].to(device).permute(1, 0)
-            q_seq = q_vals[start:end].to(device).permute(1, 0)
-            v_seq = v_vals[start:end].to(device).permute(1, 0)
+            # из [T, N, ...] → [N, T, ...]
+            obs_seq        = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim))
+                            for k, v in obs.items()}
+            next_obs_seq   = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim))
+                            for k, v in next_obs.items()}
+            actions_seq    = actions[start:end].to(device).permute(1, 0, *range(2, actions.ndim))
+            rewards_seq    = rewards[start:end].to(device).permute(1, 0)
+            dones_seq      = dones[start:end].to(device).permute(1, 0)
+            assoc_r_seq    = associated_r[start:end].to(device).permute(1, 0)
+            q_seq          = q_vals[start:end].to(device).permute(1, 0)
+            v_seq          = v_vals[start:end].to(device).permute(1, 0)
 
-            for i in range(n_envs):
-                seq = (
-                    {k: v[i] for k, v in obs_seq.items()},           # [context, ...]
-                    {k: v[i] for k, v in next_obs_seq.items()},
-                    actions_seq[i],
-                    rewards_seq[i],
-                    dones_seq[i],
-                    associated_r_seq[i],
-                    q_seq[i],
-                    v_seq[i]
-                )
-                sequences.append(seq)
+            # разбить по env и собрать список последовательностей
+            for env in range(n_envs):
+                sequences.append((
+                    {k: obs_seq[k][env]       for k in obs_seq},
+                    {k: next_obs_seq[k][env]  for k in next_obs_seq},
+                    actions_seq[env],
+                    rewards_seq[env],
+                    dones_seq[env],
+                    assoc_r_seq[env],
+                    q_seq[env],
+                    v_seq[env]
+                ))
 
-        obs_seq = {k: torch.stack([s[0][k] for s in sequences]) for k in sequences[0][0]}
-        next_obs_seq = {k: torch.stack([s[1][k] for s in sequences]) for k in sequences[0][1]}
-        actions_seq = torch.stack([s[2] for s in sequences])
-        rewards_seq = torch.stack([s[3] for s in sequences])
-        dones_seq = torch.stack([s[4] for s in sequences])
-        associated_r_seq = torch.stack([s[5] for s in sequences]) 
-        q_seq = torch.stack([s[6] for s in sequences])
-        v_seq = torch.stack([s[7] for s in sequences])   
+        # 6) Переводим всё в батч
+        obs_batch        = {k: torch.stack([s[0][k] for s in sequences]) for k in sequences[0][0]}
+        next_obs_batch   = {k: torch.stack([s[1][k] for s in sequences]) for k in sequences[0][1]}
+        actions_batch    = torch.stack([s[2] for s in sequences])
+        rewards_batch    = torch.stack([s[3] for s in sequences])
+        dones_batch      = torch.stack([s[4] for s in sequences])
+        assoc_r_batch    = torch.stack([s[5] for s in sequences])
+        q_batch          = torch.stack([s[6] for s in sequences])
+        v_batch          = torch.stack([s[7] for s in sequences])
 
         dataset = TensorDataset(
-            *list(obs_seq.values()),
-            *list(next_obs_seq.values()),
-            actions_seq,
-            rewards_seq,
-            dones_seq,
-            associated_r_seq,
-            q_seq,
-            v_seq
+            *list(obs_batch.values()),
+            *list(next_obs_batch.values()),
+            actions_batch,
+            rewards_batch,
+            dones_batch,
+            assoc_r_batch,
+            q_batch,
+            v_batch
         )
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
-        return dataloader
+
+    
+    # def sample_for_trans(self, positions: list):    
+    #     positions = torch.tensor(positions)  # T
+    #     env_ids = torch.arange(self.num_envs)  # N
+    #     ti, ei = torch.meshgrid(positions, env_ids, indexing="ij")  # T, N
+
+    #     obs_batch = self.obs[ti, ei]
+    #     next_obs_batch = self.next_obs[ti, ei]
+    #     actions_batch = self.actions[ti, ei]
+    #     rewards_batch = self.rewards[ti, ei]
+    #     dones_batch = self.dones[ti, ei]
+
+    #     obs_batch = {k: v.to(self.sample_device) for k, v in obs_batch.items()}
+    #     next_obs_batch = {k: v.to(self.sample_device) for k, v in next_obs_batch.items()}
+
+    #     return ReplayBufferSample(
+    #         obs=obs_batch,
+    #         next_obs=next_obs_batch,
+    #         actions=actions_batch.to(self.sample_device),
+    #         rewards=rewards_batch.to(self.sample_device),
+    #         dones=dones_batch.to(self.sample_device),
+    #     )
+        
+    # def make_sequential_dataloader(self, positions: list[int], context_len: int, batch_size: int, shuffle: bool = True):
+    #     pos = torch.tensor(positions)
+    #     num_steps = len(pos)
+    #     n_envs = self.num_envs
+    #     device = self.sample_device   
+        
+    #     time_idx, env_idx = torch.meshgrid(pos, torch.arange(n_envs), indexing="ij")
+        
+    #     obs = self.obs[time_idx, env_idx]
+    #     next_obs = self.next_obs[time_idx, env_idx]
+    #     actions = self.actions[time_idx, env_idx]
+    #     rewards = self.rewards[time_idx, env_idx]
+    #     dones = self.dones[time_idx, env_idx]
+    #     associated_r = self.associated_r[time_idx, env_idx]
+    #     q_vals = self.Q[time_idx, env_idx]
+    #     v_vals = self.V[time_idx, env_idx]
+
+    #     sequences = []
+    #     for start in range(num_steps - context_len + 1):
+    #         end = start + context_len
+
+    #         # Собираем последовательности: [context_len, n_envs, ...] → [n_envs, context_len, ...]
+    #         obs_seq = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim)) for k, v in obs.items()}
+    #         next_obs_seq = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim)) for k, v in next_obs.items()}
+    #         actions_seq = actions[start:end].to(device).permute(1, 0, *range(2, actions.ndim))
+    #         rewards_seq = rewards[start:end].to(device).permute(1, 0)
+    #         dones_seq = dones[start:end].to(device).permute(1, 0)
+    #         associated_r_seq = associated_r[start:end].to(device).permute(1, 0)
+    #         q_seq = q_vals[start:end].to(device).permute(1, 0)
+    #         v_seq = v_vals[start:end].to(device).permute(1, 0)
+
+    #         for i in range(n_envs):
+    #             seq = (
+    #                 {k: v[i] for k, v in obs_seq.items()},           # [context, ...]
+    #                 {k: v[i] for k, v in next_obs_seq.items()},
+    #                 actions_seq[i],
+    #                 rewards_seq[i],
+    #                 dones_seq[i],
+    #                 associated_r_seq[i],
+    #                 q_seq[i],
+    #                 v_seq[i]
+    #             )
+    #             sequences.append(seq)
+
+    #     obs_seq = {k: torch.stack([s[0][k] for s in sequences]) for k in sequences[0][0]}
+    #     next_obs_seq = {k: torch.stack([s[1][k] for s in sequences]) for k in sequences[0][1]}
+    #     actions_seq = torch.stack([s[2] for s in sequences])
+    #     rewards_seq = torch.stack([s[3] for s in sequences])
+    #     dones_seq = torch.stack([s[4] for s in sequences])
+    #     associated_r_seq = torch.stack([s[5] for s in sequences]) 
+    #     q_seq = torch.stack([s[6] for s in sequences])
+    #     v_seq = torch.stack([s[7] for s in sequences])   
+
+    #     dataset = TensorDataset(
+    #         *list(obs_seq.values()),
+    #         *list(next_obs_seq.values()),
+    #         actions_seq,
+    #         rewards_seq,
+    #         dones_seq,
+    #         associated_r_seq,
+    #         q_seq,
+    #         v_seq
+    #     )
+    #     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+    #     return dataloader
     
     
     
@@ -470,7 +601,7 @@ class Trans_PlainConv(nn.Module):
     '''
     def __init__(self,
                  in_channels=3,
-                 out_dim=227, #256,
+                 out_dim=228, #256,
                  pool_feature_map=False,
                  last_act=True, # True for ConvBody, False for CNN
                  image_size=[128, 128]
@@ -786,7 +917,7 @@ class Trans_Actor(nn.Module):
             image_size = sample_obs["depth"].shape[1:3]
 
         self.encoder = Trans_EncoderObsWrapper(
-            Trans_PlainConv(in_channels=in_channels, out_dim=227, image_size=image_size) # assume image is 64x64
+            Trans_PlainConv(in_channels=in_channels, out_dim=228, image_size=image_size) # assume image is 64x64
         )
         inner_size = self.encoder.encoder.out_dim+self.state_dim
         self.fc_mean = nn.Linear(inner_size, action_dim)
@@ -1115,19 +1246,20 @@ class Logger:
 def train_transformer(loss_proportion: int, positions: list, ascent_on: str, batch_size: int, context: int, shuffle: bool):
     
     '''
-    obs_s     torch.Size([60, 5, 29]) 
-    obs_i     torch.Size([60, 5, 64, 64, 3]) 
-    n_obs_s   torch.Size([60, 5, 29]) 
-    n_obs_i   torch.Size([60, 5, 64, 64, 3]) 
-    acts      torch.Size([60, 5, 4]) 
-    rew       torch.Size([60, 5]) 
-    dones     torch.Size([60, 5]) 
-    R         torch.Size([60, 5]) 
-    Q         torch.Size([60, 5]) 
-    V         torch.Size([60, 5])
+    obs_s     torch.Size([bs, cont, 29]) 
+    obs_i     torch.Size([bs, cont, 64, 64, 3]) 
+    n_obs_s   torch.Size([bs, cont, 29]) 
+    n_obs_i   torch.Size([bs, cont, 64, 64, 3]) 
+    acts      torch.Size([bs, cont, 4]) 
+    rew       torch.Size([bs, cont]) 
+    dones     torch.Size([bs, cont]) 
+    R         torch.Size([bs, cont]) 
+    Q         torch.Size([bs, cont]) 
+    V         torch.Size([bs, cont])
     '''
+    start_time = time.time()
     dataloader = rb.make_sequential_dataloader(positions=positions, context_len=context, batch_size=batch_size, shuffle=shuffle)
-    torch.autograd.set_detect_anomaly(True)
+    #torch.autograd.set_detect_anomaly(True)
     for batch in dataloader:
         obs_s = batch[0] # state_based obs
         obs_i = batch[1] # image_based obs
@@ -1158,8 +1290,9 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         q_predicted2 = trans_qf2({'state': obs_s, 'rgb': obs_i}, action_target)
 
         # Only last timestep
-        q_target1 = qf1({'state': obs_s[:, -1].clone(), 'rgb': obs_i[:, -1].clone()}, action_target)
-        q_target2 = qf2({'state': obs_s[:, -1].clone(), 'rgb': obs_i[:, -1].clone()}, action_target)
+        with torch.no_grad():
+            q_target1 = qf1({'state': obs_s[:, -1].clone(), 'rgb': obs_i[:, -1].clone()}, action_target)
+            q_target2 = qf2({'state': obs_s[:, -1].clone(), 'rgb': obs_i[:, -1].clone()}, action_target)
 
         trans_qf1_loss = F.mse_loss(q_predicted1, q_target1)
         trans_qf2_loss = F.mse_loss(q_predicted2, q_target2)
@@ -1208,7 +1341,12 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         # trans_q_optimizer.zero_grad()
         # trans_critic_RL_loss.backward()
         # trans_q_optimizer.step()
-
+        
+        
+    duration = time.time() - start_time
+    print(f"Transformer training completed in {duration:.2f} seconds.")
+    logger.add_scalar("Trans/Actor_BC_loss", trans_actor_BC_loss.item(), global_step)
+    logger.add_scalar("Trans/Critic_BC_loss", trans_critic_BC_loss.item(), global_step)
         
         
             
@@ -1263,9 +1401,9 @@ def evaluate_transformer():
     if logger is not None:
         eval_time = time.perf_counter() - stime
         cumulative_times["Trans_eval_time"] += eval_time
-        logger.add_scalar("time/Trans_eval_time", eval_time, global_step)
-        logger.add_scalar("eval/Trans_eval_sr_once", eval_metrics_mean['success_once'], global_step)
-        logger.add_scalar("eval/Trans_eval_return", eval_metrics_mean['return'], global_step)
+        logger.add_scalar("Trans/Trans_eval_time", eval_time, global_step)
+        logger.add_scalar("Trans/Trans_eval_sr_once", eval_metrics_mean['success_once'], global_step)
+        logger.add_scalar("Trans/Trans_eval_return", eval_metrics_mean['return'], global_step)
             
 
 
@@ -1275,7 +1413,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"MLP_RGBD_ACCELERATOR/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"REAL_ACCELERATOR/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
@@ -1417,14 +1555,14 @@ if __name__ == "__main__":
                         lr=3e-4)
     trans_actor_optimizer = optim.Adam(list(trans_actor.parameters()), lr=3e-4)
         
-    # Automatic entropy tuning
-    if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
-        trans_a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
-    else:
-        alpha = args.alpha
+    # # Automatic entropy tuning
+    # if args.autotune:
+    #     target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+    #     log_alpha = torch.zeros(1, requires_grad=True, device=device)
+    #     alpha = log_alpha.exp().item()
+    #     trans_a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
+    # else:
+    #     alpha = args.alpha
 
     # TRANSFORMER INITIALIZATION ABOVE    
 
@@ -1475,6 +1613,7 @@ if __name__ == "__main__":
                 if logger is not None:
                     logger.add_scalar(f"eval/{k}", mean, global_step)
             
+            print(positions)
             rb.add_associated_reward(positions, eval_metrics['return'][0])
             rb.add_qv_estimates(positions)
             
@@ -1490,7 +1629,7 @@ if __name__ == "__main__":
                 break
             actor.train()
             
-            train_transformer(loss_proportion=1, positions=positions, ascent_on='transformer', batch_size=10, context=5, shuffle=True)
+            train_transformer(loss_proportion=1, positions=positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
             evaluate_transformer()
             
 

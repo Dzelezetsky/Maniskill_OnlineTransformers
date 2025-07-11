@@ -1,12 +1,11 @@
 
 from collections import defaultdict
-from torch.utils.data import TensorDataset, DataLoader
 from dataclasses import dataclass
 import os
 import random
 import time
 from typing import Optional
-
+from torch.utils.data import TensorDataset, DataLoader
 import tqdm
 
 from mani_skill.utils import gym_utils
@@ -131,14 +130,14 @@ class Args:
     
     use_gates: bool = False
     """use gatings instead skip connection in transformer block"""
-    n_embd: int = 227  #483#256  
+    n_embd: int = 228  #483#256  
     """inner transformer dimention"""
     n_layer: int = 1
     n_head: int = 2
     dropout: float = 0.0
     seq_len: int = 5
     bias: bool = True
-        
+    
 
 @dataclass
 class ReplayBufferSample:
@@ -147,8 +146,10 @@ class ReplayBufferSample:
     actions: torch.Tensor
     rewards: torch.Tensor
     dones: torch.Tensor
+
 class ReplayBuffer:
-    def __init__(self, env, num_envs: int, buffer_size: int, storage_device: torch.device, sample_device: torch.device):
+    def __init__(self, env, num_envs: int, buffer_size: int,
+                 storage_device: torch.device, sample_device: torch.device):
         self.buffer_size = buffer_size
         self.pos = 0
         self.full = False
@@ -156,288 +157,193 @@ class ReplayBuffer:
         self.storage_device = storage_device
         self.sample_device = sample_device
         self.per_env_buffer_size = buffer_size // num_envs
-        # note 128x128x3 RGB data with replay buffer size 100_000 takes up around 4.7GB of GPU memory
-        # 32 parallel envs with rendering uses up around 2.2GB of GPU memory.
-        self.obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
-        # TODO (stao): optimize final observation storage
-        self.next_obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
-        self.actions = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_action_space.shape, device=storage_device)
-        self.logprobs = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.rewards = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.dones = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        
+
+        # основной буфер
+        self.obs          = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_observation_space.shape, device=storage_device)
+        self.next_obs     = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_observation_space.shape, device=storage_device)
+        self.actions      = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_action_space.shape,   device=storage_device)
+        self.rewards      = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+        self.dones        = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+
+        # доп. статистики
         self.associated_r = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.Q = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.V = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+        self.Q            = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+        self.V            = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+
+    def add_associated_reward(self, positions: list[int], rewards: torch.Tensor):
+        """
+        Добавляет associated_r, корректно обрабатывая wrap-around.
+        """
+        if not positions:
+            return
+
+        # нормализуем позиции по модулю размера буфера
+        buf = self.per_env_buffer_size
+        pos = torch.tensor([p % buf for p in positions], device=self.storage_device, dtype=torch.long)  # [T]
+
+        # расширяем rewards: [1, N] → [T, N]
+        R = rewards.to(self.storage_device).unsqueeze(0).expand(len(pos), -1)
+
+        # аккуратно добавляем
+        self.associated_r[pos, :] += R
 
 
-    def add_associated_reward(self, positions, rewards):
-        rewards = rewards.unsqueeze(0).repeat(len(positions), 1)   #n_e -> len(positions), n_e
-        self.associated_r[[positions]] += rewards
-        
     def add_qv_estimates(self, positions: list[int]):
         """
-        Использует associated_r и rewards для вычисления Q(s,a) и V(s)
+        Вычисляет Q/V, учитывая wrap-around через модуль и хронологический порядок.
         """
-        pos = torch.tensor(positions)  # [T]
-        env_ids = torch.arange(self.num_envs)  # [N]
-        ti, ei = torch.meshgrid(pos, env_ids, indexing="ij")  # [T, N]
+        if not positions:
+            return
 
-        # [T, N]
-        rewards = self.rewards[ti, ei]
-        associated_r = self.associated_r[ti, ei]
+        # 1) нормализуем и ищем wrap-point
+        buf = self.per_env_buffer_size
+        norm = [p % buf for p in positions]
+        split = next((i+1 for i in range(len(norm)-1) if norm[i] > norm[i+1]), None)
 
-        # Cumulative sum по временной оси (dim=0), но без включения текущего шага для Q
-        # → Q = R - cumsum без текущего
-        # → V = R - cumsum включая текущий
-        cum_rewards_exclusive = torch.cumsum(rewards, dim=0) - rewards  # [T, N]
-        cum_rewards_inclusive = torch.cumsum(rewards, dim=0)  # [T, N]
+        # 2) упорядочиваем в хронологическом порядке
+        ordered = (norm[split:] + norm[:split]) if split is not None else norm[:]
 
-        q_values = associated_r - cum_rewards_exclusive
-        v_values = associated_r - cum_rewards_inclusive
+        # 3) собираем индексы
+        pos = torch.tensor(ordered, device=self.storage_device, dtype=torch.long)  # [T]
+        env = torch.arange(self.num_envs, device=self.storage_device)              # [N]
+        ti, ei = torch.meshgrid(pos, env, indexing="ij")                           # [T, N]
 
-        self.Q[ti, ei] = q_values
-        self.V[ti, ei] = v_values
-    
-        
-    
-    def add(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
-        if self.storage_device == torch.device("cpu"):
-            obs = {k: v.cpu() for k, v in obs.items()}
-            next_obs = {k: v.cpu() for k, v in next_obs.items()}
-            action = action.cpu()
-            reward = reward.cpu()
-            done = done.cpu()
+        # 4) берём R и A
+        R = self.rewards[ti, ei]         # [T, N]
+        A = self.associated_r[ti, ei]    # [T, N]
 
-        self.obs[self.pos] = obs
-        self.next_obs[self.pos] = next_obs
+        # 5) считаем Q/V
+        cum_excl = torch.cumsum(R, dim=0) - R
+        cum_incl = torch.cumsum(R, dim=0)
 
-        self.actions[self.pos] = action
-        self.rewards[self.pos] = reward
-        self.dones[self.pos] = done
+        Qv = A - cum_excl
+        Vv = A - cum_incl
 
-        self.pos += 1
-        if self.pos == self.per_env_buffer_size:
-            self.full = True
-            self.pos = 0
-            return self.per_env_buffer_size 
-        
-        return self.pos-1
-    
-        
-    def sample(self, batch_size: int):
-        if self.full:
-            batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size, ))
-        else:
-            batch_inds = torch.randint(0, self.pos, size=(batch_size, ))
-        env_inds = torch.randint(0, self.num_envs, size=(batch_size, ))
-        obs_sample = self.obs[batch_inds, env_inds]
-        next_obs_sample = self.next_obs[batch_inds, env_inds]
-        obs_sample = {k: v.to(self.sample_device) for k, v in obs_sample.items()}
-        next_obs_sample = {k: v.to(self.sample_device) for k, v in next_obs_sample.items()}
-        return ReplayBufferSample(
-            obs=obs_sample,
-            next_obs=next_obs_sample,
-            actions=self.actions[batch_inds, env_inds].to(self.sample_device),
-            rewards=self.rewards[batch_inds, env_inds].to(self.sample_device),
-            dones=self.dones[batch_inds, env_inds].to(self.sample_device)
-        )
-        
-    def sample_for_trans(self, positions: list):    
-        positions = torch.tensor(positions)  # T
-        env_ids = torch.arange(self.num_envs)  # N
-        ti, ei = torch.meshgrid(positions, env_ids, indexing="ij")  # T, N
+        # 6) записываем обратно
+        self.Q[pos, :] = Qv
+        self.V[pos, :] = Vv
 
-        obs_batch = self.obs[ti, ei]
-        next_obs_batch = self.next_obs[ti, ei]
-        actions_batch = self.actions[ti, ei]
-        rewards_batch = self.rewards[ti, ei]
-        dones_batch = self.dones[ti, ei]
 
-        obs_batch = {k: v.to(self.sample_device) for k, v in obs_batch.items()}
-        next_obs_batch = {k: v.to(self.sample_device) for k, v in next_obs_batch.items()}
+    def make_sequential_dataloader(self,
+                                   positions: list[int],
+                                   context_len: int,
+                                   batch_size: int,
+                                   shuffle: bool = True):
+        """
+        Собирает скользящие окна, учитывая wrap-around.
+        """
+        if len(positions) < context_len:
+            raise ValueError("len(positions) < context_len")
 
-        return ReplayBufferSample(
-            obs=obs_batch,
-            next_obs=next_obs_batch,
-            actions=actions_batch.to(self.sample_device),
-            rewards=rewards_batch.to(self.sample_device),
-            dones=dones_batch.to(self.sample_device),
-        )
-        
-    def make_sequential_dataloader(self, positions: list[int], context_len: int, batch_size: int, shuffle: bool = True):
-        pos = torch.tensor(positions)
-        num_steps = len(pos)
-        n_envs = self.num_envs
-        device = self.sample_device   
-        
-        time_idx, env_idx = torch.meshgrid(pos, torch.arange(n_envs), indexing="ij")
-        
-        obs = self.obs[time_idx, env_idx]
-        next_obs = self.next_obs[time_idx, env_idx]
-        actions = self.actions[time_idx, env_idx]
-        rewards = self.rewards[time_idx, env_idx]
-        dones = self.dones[time_idx, env_idx]
-        associated_r = self.associated_r[time_idx, env_idx]
-        q_vals = self.Q[time_idx, env_idx]
-        v_vals = self.V[time_idx, env_idx]
+        # 1) нормализуем и находим wrap-point
+        buf = self.per_env_buffer_size
+        norm = [p % buf for p in positions]
+        split = next((i+1 for i in range(len(norm)-1) if norm[i] > norm[i+1]), None)
 
+        # 2) упорядочиваем
+        ordered = (norm[split:] + norm[:split]) if split is not None else norm[:]
+
+        # 3) собираем весь временной ряд [T,N,...]
+        pos = torch.tensor(ordered, device=self.storage_device, dtype=torch.long)
+        env = torch.arange(self.num_envs, device=self.storage_device)
+        ti, ei = torch.meshgrid(pos, env, indexing="ij")
+
+        obs_seq      = self.obs[ti, ei]
+        next_obs_seq = self.next_obs[ti, ei]
+        act_seq      = self.actions[ti, ei]
+        rew_seq      = self.rewards[ti, ei]
+        done_seq     = self.dones[ti, ei]
+        ar_seq       = self.associated_r[ti, ei]
+        Q_seq        = self.Q[ti, ei]
+        V_seq        = self.V[ti, ei]
+
+        # 4) строим скользящие окна и раскладываем по env
         sequences = []
-        for start in range(num_steps - context_len + 1):
+        T = pos.size(0)
+        for start in range(T - context_len + 1):
             end = start + context_len
 
-            # Собираем последовательности: [context_len, n_envs, ...] → [n_envs, context_len, ...]
-            obs_seq = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim)) for k, v in obs.items()}
-            next_obs_seq = {k: v[start:end].to(device).permute(1, 0, *range(2, v.ndim)) for k, v in next_obs.items()}
-            actions_seq = actions[start:end].to(device).permute(1, 0, *range(2, actions.ndim))
-            rewards_seq = rewards[start:end].to(device).permute(1, 0)
-            dones_seq = dones[start:end].to(device).permute(1, 0)
-            associated_r_seq = associated_r[start:end].to(device).permute(1, 0)
-            q_seq = q_vals[start:end].to(device).permute(1, 0)
-            v_seq = v_vals[start:end].to(device).permute(1, 0)
+            o = obs_seq[start:end].permute(1, 0, *range(2, obs_seq.ndim)).to(self.sample_device)
+            no = next_obs_seq[start:end].permute(1, 0, *range(2, next_obs_seq.ndim)).to(self.sample_device)
+            a = act_seq[start:end].permute(1, 0, *range(2, act_seq.ndim)).to(self.sample_device)
+            r = rew_seq[start:end].permute(1, 0).to(self.sample_device)
+            d = done_seq[start:end].permute(1, 0).to(self.sample_device)
+            ar = ar_seq[start:end].permute(1, 0).to(self.sample_device)
+            Qv = Q_seq[start:end].permute(1, 0).to(self.sample_device)
+            Vv = V_seq[start:end].permute(1, 0).to(self.sample_device)
 
-            for i in range(n_envs):
-                seq = (
-                    {k: v[i] for k, v in obs_seq.items()},           # [context, ...]
-                    {k: v[i] for k, v in next_obs_seq.items()},
-                    actions_seq[i],
-                    rewards_seq[i],
-                    dones_seq[i],
-                    associated_r_seq[i],
-                    q_seq[i],
-                    v_seq[i]
-                )
-                sequences.append(seq)
+            for e in range(self.num_envs):
+                sequences.append((o[e], no[e], a[e], r[e], d[e], ar[e], Qv[e], Vv[e]))
 
-        obs_seq = {k: torch.stack([s[0][k] for s in sequences]) for k in sequences[0][0]}
-        next_obs_seq = {k: torch.stack([s[1][k] for s in sequences]) for k in sequences[0][1]}
-        actions_seq = torch.stack([s[2] for s in sequences])
-        rewards_seq = torch.stack([s[3] for s in sequences])
-        dones_seq = torch.stack([s[4] for s in sequences])
-        associated_r_seq = torch.stack([s[5] for s in sequences]) 
-        q_seq = torch.stack([s[6] for s in sequences])
-        v_seq = torch.stack([s[7] for s in sequences])   
-
+        # 5) упаковываем в DataLoader
+        o_b, no_b, a_b, r_b, d_b, ar_b, Q_b, V_b = zip(*sequences)
         dataset = TensorDataset(
-            *list(obs_seq.values()),
-            *list(next_obs_seq.values()),
-            actions_seq,
-            rewards_seq,
-            dones_seq,
-            associated_r_seq,
-            q_seq,
-            v_seq
+            torch.stack(o_b),
+            torch.stack(no_b),
+            torch.stack(a_b),
+            torch.stack(r_b),
+            torch.stack(d_b),
+            torch.stack(ar_b),
+            torch.stack(Q_b),
+            torch.stack(V_b),
         )
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-
-        return dataloader
-    
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)   
     
     
 ########## SPECIAL TOOLS FOR TRANSFORMER BELOW  ##################
 
-class Trans_PlainConv(nn.Module):
-    '''
-    Conv Net constructor
-    '''
-    def __init__(self,
-                 in_channels=3,
-                 out_dim=227, #256,
-                 pool_feature_map=False,
-                 last_act=True, # True for ConvBody, False for CNN
-                 image_size=[128, 128]
-                 ):
+class PositionalEncoding(nn.Module):
+    def __init__(self, dim, device, min_timescale=2.0, max_timescale=1e4):
         super().__init__()
-        # assume input image size is 128x128 or 64x64
+        self.device = device
+        freqs = torch.arange(0, dim, min_timescale).to(self.device)
+        inv_freqs = max_timescale ** (-freqs / dim)
+        self.register_buffer("inv_freqs", inv_freqs)
 
-        self.out_dim = out_dim
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels, 16, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(4, 4) if image_size[0] == 128 and image_size[1] == 128 else nn.MaxPool2d(2, 2),  # [32, 32]
-            nn.Conv2d(16, 32, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [16, 16]
-            nn.Conv2d(32, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [8, 8]
-            nn.Conv2d(64, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [4, 4]
-            nn.Conv2d(64, 64, 1, padding=0, bias=True), nn.ReLU(inplace=True),
-        )
+    def forward(self, seq_len):
+        seq = torch.arange(seq_len - 1, -1, -1.0).to(self.device)
+        sinusoidal_inp = rearrange(seq, "n -> n ()") * rearrange(self.inv_freqs, "d -> () d")
+        pos_emb = torch.cat((sinusoidal_inp.sin(), sinusoidal_inp.cos()), dim=-1)
+        return pos_emb
 
-        if pool_feature_map:
-            self.pool = nn.AdaptiveMaxPool2d((1, 1))
-            self.fc = make_mlp(128, [out_dim], last_act=last_act)
-        else:
-            self.pool = None
-            self.fc = make_mlp(64 * 4 * 4, [out_dim], last_act=last_act)
 
-        self.reset_parameters()
 
-    def reset_parameters(self):
-        for name, module in self.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+class GRUGate(nn.Module):
 
-    def forward(self, image):
-        x = self.cnn(image)
-        if self.pool is not None:
-            x = self.pool(x)
-        x = x.flatten(1)
-        x = self.fc(x)
-        return x
-
-class Trans_EncoderObsWrapper(nn.Module):
-    '''
-    Preparation module before applying CNN
-    '''
-    def __init__(self, encoder):
-        super().__init__()
-        self.encoder = encoder
-
-    def forward(self, obs):
-        if "rgb" in obs:
-            rgb = obs['rgb'].float() / 255.0 # (B, H, W, 3*k)
-        if "depth" in obs:
-            depth = obs['depth'].float() # (B, H, W, 1*k)
-        if "rgb" and "depth" in obs:
-            img = torch.cat([rgb, depth], dim=3) # (B, H, W, C)
-        elif "rgb" in obs:
-            img = rgb
-        elif "depth" in obs:
-            img = depth
-        else:
-            raise ValueError(f"Observation dict must contain 'rgb' or 'depth'")
+    def __init__(self, input_dim: int, bg: float = 0.0):
         
-        #print(img.shape)
-        if len(img.shape) == 5: # we are on evaluation step
-            n_e, cont, h, w, c = img.shape
-            img = img.reshape(n_e*cont, h, w, c)
-            img = img.permute(0, 3, 1, 2) # (B, C, H, W)
-            img = self.encoder(img)
-            img = img.reshape(n_e, cont, self.encoder.out_dim)
-            
-        else:                   # we are on train step
-            bs, n_e, cont, h, w, c = img.shape
-            img = img.reshape(bs*n_e*cont, h, w, c)
-            img = img.permute(0, 3, 1, 2) # (B, C, H, W)
-            img = self.encoder(img)
-            img = img.reshape(bs, n_e, cont, self.encoder.out_dim)
-        
-        
-        return img
+        super(GRUGate, self).__init__()
+        self.Wr = nn.Linear(input_dim, input_dim, bias=False)
+        self.Ur = nn.Linear(input_dim, input_dim, bias=False)
+        self.Wz = nn.Linear(input_dim, input_dim, bias=False)
+        self.Uz = nn.Linear(input_dim, input_dim, bias=False)
+        self.Wg = nn.Linear(input_dim, input_dim, bias=False)
+        self.Ug = nn.Linear(input_dim, input_dim, bias=False)
+        self.bg = nn.Parameter(torch.full([input_dim], bg))  # bias
+        self.sigmoid = nn.Sigmoid()
+        self.tanh = nn.Tanh()
+        nn.init.xavier_uniform_(self.Wr.weight)
+        nn.init.xavier_uniform_(self.Ur.weight)
+        nn.init.xavier_uniform_(self.Wz.weight)
+        nn.init.xavier_uniform_(self.Uz.weight)
+        nn.init.xavier_uniform_(self.Wg.weight)
+        nn.init.xavier_uniform_(self.Ug.weight)
 
-def make_mlp(in_channels, mlp_channels, act_builder=nn.ReLU, last_act=True):
-    c_in = in_channels
-    module_list = []
-    for idx, c_out in enumerate(mlp_channels):
-        module_list.append(nn.Linear(c_in, c_out))
-        if last_act or idx < len(mlp_channels) - 1:
-            module_list.append(act_builder())
-        c_in = c_out
-    return nn.Sequential(*module_list)
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
+        """        
+        Arguments:
+            x {torch.tensor} -- First input
+            y {torch.tensor} -- Second input
+        Returns:
+            {torch.tensor} -- Output
+        """
+        r = self.sigmoid(self.Wr(y) + self.Ur(x))
+        z = self.sigmoid(self.Wz(y) + self.Uz(x) - self.bg)
+        h = self.tanh(self.Wg(y) + self.Ug(torch.mul(r, x)))
 
+        # print(f'mean z: {z.mean()}')
 
+        return torch.mul(1 - z, x) + torch.mul(z, h) #, z.mean()
 
 
 
@@ -455,18 +361,18 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, input_dim):
+    def __init__(self, config):
         super().__init__()
-        #assert config.n_embd % config.n_head == 0
+        assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(input_dim, 3 * input_dim, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(input_dim, input_dim, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
-        self.n_embd = input_dim
+        self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -507,11 +413,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config, input_dim):
+    def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(input_dim, 4 * input_dim, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * input_dim, input_dim, bias=config.bias)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -524,20 +430,16 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, inner_size):
+    def __init__(self, config):
         super().__init__()
-        
-        encoder = Trans_EncoderObsWrapper
-        
-        
-        self.ln_1 = LayerNorm(inner_size, bias=config.bias)
-        self.attn = CausalSelfAttention(config, inner_size)
-        self.ln_2 = LayerNorm(inner_size, bias=config.bias)
-        self.mlp = MLP(config, inner_size)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
 
         if config.use_gates:
-            self.skip_fn_1 = GRUGate(inner_size, 2.0)
-            self.skip_fn_2 = GRUGate(inner_size, 2.0)
+            self.skip_fn_1 = GRUGate(config.n_embd, 2.0)
+            self.skip_fn_2 = GRUGate(config.n_embd, 2.0)
         else:
             self.skip_fn_1 = lambda x, y: x + y
             self.skip_fn_2 = lambda x, y: x + y
@@ -553,14 +455,14 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
 
-    def __init__(self, config, inner_size):
+    def __init__(self, config):
         super().__init__()
 
         self.config = config
-        self.pos_embedding = nn.Embedding(config.max_episode_steps, inner_size)
+        self.pos_embedding = nn.Embedding(config.max_episode_steps, config.n_embd)
 
-        self.transformer_layers = nn.ModuleList([Block(config, inner_size) for _ in range(config.n_layer)])
-        self.ln_f = LayerNorm(inner_size, bias=config.bias)
+        self.transformer_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
         self.drop = nn.Dropout(config.dropout)
 
         
@@ -595,9 +497,6 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
         pos_emb = self.pos_embedding(pos) # position embeddings of shape (t, n_embd)
         
-        #print(f"x: {x.shape}") 
-        #print(f"pe: {pos_emb.shape}")  
-        
         x = self.drop(x + pos_emb)
         for block in self.transformer_layers:
             x = block(x)
@@ -605,99 +504,51 @@ class GPT(nn.Module):
 
         return x
     
-class GRUGate(nn.Module):
-
-    def __init__(self, input_dim: int, bg: float = 0.0):
-        
-        super(GRUGate, self).__init__()
-        self.Wr = nn.Linear(input_dim, input_dim, bias=False)
-        self.Ur = nn.Linear(input_dim, input_dim, bias=False)
-        self.Wz = nn.Linear(input_dim, input_dim, bias=False)
-        self.Uz = nn.Linear(input_dim, input_dim, bias=False)
-        self.Wg = nn.Linear(input_dim, input_dim, bias=False)
-        self.Ug = nn.Linear(input_dim, input_dim, bias=False)
-        self.bg = nn.Parameter(torch.full([input_dim], bg))  # bias
-        self.sigmoid = nn.Sigmoid()
-        self.tanh = nn.Tanh()
-        nn.init.xavier_uniform_(self.Wr.weight)
-        nn.init.xavier_uniform_(self.Ur.weight)
-        nn.init.xavier_uniform_(self.Wz.weight)
-        nn.init.xavier_uniform_(self.Uz.weight)
-        nn.init.xavier_uniform_(self.Wg.weight)
-        nn.init.xavier_uniform_(self.Ug.weight)
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
-        """        
-        Arguments:
-            x {torch.tensor} -- First input
-            y {torch.tensor} -- Second input
-        Returns:
-            {torch.tensor} -- Output
-        """
-        r = self.sigmoid(self.Wr(y) + self.Ur(x))
-        z = self.sigmoid(self.Wz(y) + self.Uz(x) - self.bg)
-        h = self.tanh(self.Wg(y) + self.Ug(torch.mul(r, x)))
-
-        # print(f'mean z: {z.mean()}')
-
-        return torch.mul(1 - z, x) + torch.mul(z, h)
-        
-    
 class Trans_Actor(nn.Module):
-    def __init__(self, envs, args, sample_obs):
+    def __init__(self, env, args):
         super().__init__()
-        action_dim = np.prod(envs.single_action_space.shape)
-        self.state_dim = envs.single_observation_space['state'].shape[0] if 'state' in envs.single_observation_space.keys() else 0
-        print(f"actor sd = {self.state_dim}")
-        # count number of channels and image size
-        in_channels = 0
-        if "rgb" in sample_obs:
-            in_channels += sample_obs["rgb"].shape[-1]
-            image_size = sample_obs["rgb"].shape[1:3]
-        if "depth" in sample_obs:
-            in_channels += sample_obs["depth"].shape[-1]
-            image_size = sample_obs["depth"].shape[1:3]
-
-        self.encoder = Trans_EncoderObsWrapper(
-            Trans_PlainConv(in_channels=in_channels, out_dim=227, image_size=image_size) # assume image is 64x64
-        )
-        inner_size = self.encoder.encoder.out_dim+self.state_dim
-        self.fc_mean = nn.Linear(inner_size, action_dim)
-        self.fc_logstd = nn.Linear(inner_size, action_dim)
-        self.action_scale = torch.FloatTensor((envs.single_action_space.high - envs.single_action_space.low) / 2.0)
-        self.action_bias = torch.FloatTensor((envs.single_action_space.high + envs.single_action_space.low) / 2.0)
+        self.transformer = GPT(args)
+        self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
         
-        self.transformer = GPT(args, inner_size)
+        self.head = nn.Sequential(
+            nn.Linear(args.n_embd, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+        )
+        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+        # action rescaling
+        h, l = env.single_action_space.high, env.single_action_space.low
+        self.register_buffer("action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32))
+        # will be saved in the state_dict
 
-    def get_feature(self, obs, detach_encoder=False):
-        #print(f"x before cnn {obs[args.obs_mode].shape} and {obs['state'].shape}")
-        visual_feature = self.encoder(obs)
-        #print(f"x before cat with state {visual_feature.shape}")
-        if detach_encoder:
-            visual_feature = visual_feature.detach()
-        x = torch.cat([visual_feature, obs['state']], dim=-1)
-        #print(f"x after cat with state {x.shape}")
-    
-        return self.transformer(x)[:,-1,:], visual_feature
-    
-    def forward(self, obs, detach_encoder=False):
-        x, visual_feature = self.get_feature(obs, detach_encoder)
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.transformer(x)[:,-1,:]
+        x = self.head(x)
+        
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
         log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
 
-        return mean, log_std, visual_feature
+        return mean, log_std   ### !!! squeeze!
 
-    def get_eval_action(self, obs):
-        mean, log_std, _ = self(obs)
-        self.action_scale = self.action_scale.to(mean.device)
-        self.action_bias = self.action_bias.to(mean.device)
+    def get_eval_action(self, x):
+        x = self.encoder(x)
+        x = self.transformer(x)[:, -1, :]
+        x = self.head(x)
+        
+        mean = self.fc_mean(x)
         action = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action
+        return action   ### !!! squeeze!
 
-    def get_action(self, obs, detach_encoder=False):
-        mean, log_std, visual_feature = self(obs, detach_encoder)
+    def get_action(self, x):
+        mean, log_std = self(x)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
@@ -708,31 +559,24 @@ class Trans_Actor(nn.Module):
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean, visual_feature
+        return action, log_prob, mean
 
     def to(self, device):
         self.action_scale = self.action_scale.to(device)
         self.action_bias = self.action_bias.to(device)
         return super().to(device)
-    
-
-
+# ALGO LOGIC: initialize agent here:
 class Trans_SoftQNetwork(nn.Module):
     '''
     Q-network for Transformer-based maniskill tasks
     '''
-    def __init__(self, env, args, encoder: Trans_EncoderObsWrapper):
+    def __init__(self, env, args):
         super().__init__()
-        self.encoder = encoder
-        action_dim = np.prod(env.single_action_space.shape)
-        self.state_dim = env.single_observation_space['state'].shape[0] if 'state' in env.single_observation_space.keys() else 0
-        print(f"q_net sd = {self.state_dim}")
-        inner_size = encoder.encoder.out_dim+self.state_dim
         
-        self.transformer = GPT(args, inner_size)
-        
+        self.transformer = GPT(args)
+        self.encoder = nn.Linear(np.array(env.single_observation_space.shape).prod(), args.n_embd)
         self.net = nn.Sequential(
-            nn.Linear(encoder.encoder.out_dim+action_dim+self.state_dim, 256),
+            nn.Linear(args.n_embd + np.prod(env.single_action_space.shape), 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
@@ -741,24 +585,15 @@ class Trans_SoftQNetwork(nn.Module):
             nn.Linear(256, 1),
         )
 
-    def forward(self, obs, action, visual_feature=None, detach_encoder=False):
-        if visual_feature is None:
-            visual_feature = self.encoder(obs) # img -> vec
-        if detach_encoder:
-            visual_feature = visual_feature.detach()
-        if self.state_dim != 0:
-            trans_inp = torch.cat([visual_feature, obs["state"]], dim=-1)
-            trans_out = self.transformer(trans_inp)[:, -1, :]
-        else:
-            trans_out = self.transformer(visual_feature)[:, -1, :]
-        x = torch.cat([trans_out, action], dim=-1) 
-        
-        return self.net(x)
+    def forward(self, x, a):                # x = (batch,cont,s_d)   a = (batch,a_d)
+        x = self.encoder(x)                 # x = (batch,cont,n_embd)
+        x = self.transformer(x)[:, -1, :]   # x = (batch,n_embd)
+        x = torch.cat([x, a], 1)            # x = (batch,n_embd+a_d)
+        return self.net(x)                  # x = (batch,1)
 
-    
-##################### TOOLS FOR TRANS  ABOVE ##################################    
-    
-    
+
+
+########## SPECIAL TOOLS FOR TRANSFORMER ABOVE  ##################  
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
@@ -847,79 +682,81 @@ class Logger:
     def close(self):
         self.writer.close()
         
-        
-        
+
 def train_transformer(loss_proportion: int, positions: list, ascent_on: str, batch_size: int, context: int, shuffle: bool):
     
     '''
-    obs_s     torch.Size([60, 5, 29]) 
-    obs_i     torch.Size([60, 5, 64, 64, 3]) 
-    n_obs_s   torch.Size([60, 5, 29]) 
-    n_obs_i   torch.Size([60, 5, 64, 64, 3]) 
-    acts      torch.Size([60, 5, 4]) 
-    rew       torch.Size([60, 5]) 
-    dones     torch.Size([60, 5]) 
-    R         torch.Size([60, 5]) 
-    Q         torch.Size([60, 5]) 
-    V         torch.Size([60, 5])
+    obs_s     torch.Size([bs, cont, s_d]) 
+    n_obs   torch.Size([bs, cont, s_d]) 
+    acts      torch.Size([bs, cont, 4]) 
+    rew       torch.Size([bs, cont]) 
+    dones     torch.Size([bs, cont]) 
+    R         torch.Size([bs, cont]) 
+    Q         torch.Size([bs, cont]) 
+    V         torch.Size([bs, cont])
     '''
+    start_time = time.time()
     dataloader = rb.make_sequential_dataloader(positions=positions, context_len=context, batch_size=batch_size, shuffle=shuffle)
-    
+    #torch.autograd.set_detect_anomaly(True)
     for batch in dataloader:
-        obs_s = batch[0] # state_based obs
-        obs_i = batch[1] # image_based obs
-        n_obs_s = batch[2] # state_based next obs
-        n_obs_i = batch[3] # image_based next obs
-        acts = batch[4]
-        rew = batch[5]
-        dones = batch[6]
-        R = batch[7]  # Associated rewards with the episode under the positions
-        Q = batch[8]  # Real Q values associated with states and observation on the positions
-        V = batch[9]  # Real V values
+        obs = batch[0] # state_based obs
+        n_obs = batch[1] # state_based next obs
+        acts = batch[2]
+        rew = batch[3]
+        dones = batch[4]
+        R = batch[5]  # Associated rewards with the episode under the positions
+        Q = batch[6]  # Real Q values associated with states and observation on the positions
+        V = batch[7]  # Real V values
     
         #ACTOR BC LOSS
-        predicted_action, _, _, _ = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
-        target_action = acts[:,-1:].squeeze(1)
+        predicted_action, _, _, _ = trans_actor.get_action(obs)
+        target_action = acts[:, -1].clone()  
         criterion = nn.MSELoss()
-        
         trans_actor_BC_loss = criterion(predicted_action, target_action)
         
+        trans_actor_optimizer.zero_grad()
+        trans_actor_BC_loss.backward()
+        trans_actor_optimizer.step()
         
         
-        #CRITIC BC LOSS
-        q_predicted1 = trans_qf1({'state':obs_s,'rgb':obs_i}, acts[:,-1:].squeeze(1))
-        q_predicted2 = trans_qf2({'state':obs_s,'rgb':obs_i}, acts[:,-1:].squeeze(1))
+        # CRITIC BC LOSS
+        action_target = acts[:, -1].clone()
 
-        q_target1 = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, acts[:,-1:].squeeze(1))
-        q_target2 =  qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, acts[:,-1:].squeeze(1))
+        q_predicted1 = trans_qf1(obs, action_target)
+        q_predicted2 = trans_qf2(obs, action_target)
 
-        criterion1 = nn.MSELoss()
-        criterion2 = nn.MSELoss()
-        trans_qf1_loss = criterion1(q_predicted1, q_target1)
-        trans_qf2_loss = criterion2(q_predicted2, q_target1)
-        
+        # Only last timestep
+        with torch.no_grad():
+            q_target1 = qf1(obs, action_target)
+            q_target2 = qf2(obs, action_target)
+
+        trans_qf1_loss = F.mse_loss(q_predicted1, q_target1)
+        trans_qf2_loss = F.mse_loss(q_predicted2, q_target2)
         trans_critic_BC_loss = trans_qf1_loss + trans_qf2_loss
         
+        trans_q_optimizer.zero_grad()
+        trans_critic_BC_loss.backward()
+        trans_q_optimizer.step()
         
         
         #ACTOR RL LOSS
-        pi, log_pi, _, visual_feature = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
+        # pi, log_pi, _, visual_feature = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
         
-        if ascent_on == 'transformer':
-            qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi, visual_feature, detach_encoder=True)
-            qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi, visual_feature, detach_encoder=True)
-        elif ascent_on == 'accelerator':
-            qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi, visual_feature, detach_encoder=True)
-            qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi, visual_feature, detach_encoder=True)
+        # pi_detached = pi.clone()
+        # if ascent_on == 'transformer':
+        #     qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
+        #     qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
+        # elif ascent_on == 'accelerator':
+        #     qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
+        #     qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
         
-        min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-        trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
+        # min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
+        # #print(f"ACTOR RL LOSS: {min_qf_pi.shape} vs {log_pi.shape}")
+        # trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
         
-        '''
-        to do: доделать alpha коэфф. решить, пойдёт он от акселератора или будет свой отдельный
-        '''
-        
-        
+        # trans_actor_optimizer.zero_grad()
+        # trans_actor_RL_loss.backward()
+        # trans_actor_optimizer.step()
         
         #CRITIC RL LOSS
         '''
@@ -927,31 +764,28 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         но потом при файнтюне он снова понадобится так как у нас больше не будет R
         таргеты можно сразу убрать и на момент файнтюна инициализировать копиями критиков
         '''
-        next_q_value = Q
+        # Q_target = Q[:, -1].clone()
+        # action_target = acts[:, -1].clone()
 
-        qf1_a_values = trans_qf1({'state':obs_s,'rgb':obs_i}, acts[:,-1:].squeeze(1)).view(-1)
-        qf2_a_values = trans_qf2({'state':obs_s,'rgb':obs_i}, acts[:,-1:].squeeze(1)).view(-1)
-        qf1_loss = F.mse_loss(qf1_a_values, Q)
-        qf2_loss = F.mse_loss(qf2_a_values, Q)
-        
-        trans_critic_RL_loss = qf1_loss + qf2_loss
+        # qf1_a_values = trans_qf1({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
+        # qf2_a_values = trans_qf2({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
 
+        # qf1_loss = F.mse_loss(qf1_a_values, Q_target)
+        # qf2_loss = F.mse_loss(qf2_a_values, Q_target)
+        # trans_critic_RL_loss = qf1_loss + qf2_loss
         
-        #TOTAL CRITIC LOSS
-        total_critic_loss = trans_critic_RL_loss + loss_proportion*trans_critic_BC_loss
-        trans_q_optimizer.zero_grad()
-        total_critic_loss.backward()
-        trans_q_optimizer.step()
+        # trans_q_optimizer.zero_grad()
+        # trans_critic_RL_loss.backward()
+        # trans_q_optimizer.step()
         
-        #TOTAL ACTOR LOSS
-        total_actor_loss = trans_actor_RL_loss + loss_proportion*trans_actor_BC_loss
-        trans_actor_optimizer.zero_grad()
-        total_actor_loss.backward()
-        trans_actor_optimizer.step()
+        
+    duration = time.time() - start_time
+    print(f"Transformer training completed in {duration:.2f} seconds.")
+    logger.add_scalar("Trans/Actor_BC_loss", trans_actor_BC_loss.item(), global_step)
+    logger.add_scalar("Trans/Critic_BC_loss", trans_critic_BC_loss.item(), global_step)
+        
+        
             
-
-    
-    
 def evaluate_transformer():
     # evaluate
     rew_list = []
@@ -959,31 +793,22 @@ def evaluate_transformer():
     trans_actor.eval()
     stime = time.perf_counter()
     
-    eval_obs, _ = trans_actor.reset()
+    eval_obs, _ = trans_eval_envs.reset()
     
-    _h,_w,_c = trans_actor.single_observation_space[args.obs_mode].shape
-    eval_img_obs = torch.empty((args.num_eval_envs, 0, _h, _w, _c)).to(device)   #n_e, 0, s_d
-    eval_img_obs = torch.cat([eval_img_obs, eval_obs[args.obs_mode].unsqueeze(1)], dim=1)
-    
-    eval_vec_obs = torch.empty((args.num_eval_envs, 0, trans_actor.single_observation_space['state'].shape[0])).to(device)   #n_e, 0, s_d
-    eval_vec_obs = torch.cat([eval_vec_obs, eval_obs['state'].unsqueeze(1)], dim=1)
+    eval_observations = torch.empty((args.num_eval_envs, 0, envs.single_observation_space.shape[0])).to(device)   #n_e, 0, s_d
+    eval_observations = torch.cat([eval_observations, eval_obs.unsqueeze(1)], dim=1)
     
     eval_metrics = defaultdict(list)
     num_episodes = 0
     for _ in range(args.num_eval_steps):  #num_eval_steps = 50
         
-        if eval_vec_obs.shape[1] > args.seq_len:
-            eval_img_obs = eval_img_obs[:, -args.seq_len:,]
-            eval_vec_obs = eval_vec_obs[:, -args.seq_len:,]
+        if eval_observations.shape[1] > args.seq_len:
+            eval_observations = eval_observations[:, -args.seq_len:,]
         
         
         with torch.no_grad():
-            obs4actor = {'state': eval_vec_obs, args.obs_mode: eval_img_obs}
-            eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = trans_eval_envs.step(trans_actor.get_eval_action(obs4actor))
-            
-            eval_img_obs = torch.cat([eval_img_obs, eval_obs[args.obs_mode].unsqueeze(1)], dim=1)
-            eval_vec_obs = torch.cat([eval_vec_obs, eval_obs['state'].unsqueeze(1)], dim=1)
-            
+            eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(actor.get_eval_action(eval_observations))
+            eval_observations = torch.cat([eval_observations, eval_obs.unsqueeze(1)], dim=1)
             rew_list.append(eval_rew.cpu().numpy().tolist())
             if "final_info" in eval_infos:
                 mask = eval_infos["_final_info"]
@@ -996,17 +821,18 @@ def evaluate_transformer():
         eval_metrics_mean[k] = mean
         if logger is not None:
             logger.add_scalar(f"eval/{k}", mean, global_step)
-    pbar.set_description(
+    print(
         f"Trans success_once: {eval_metrics_mean['success_once']:.2f}, "
         f"Trans return: {eval_metrics_mean['return']:.2f}"
     )
     if logger is not None:
         eval_time = time.perf_counter() - stime
         cumulative_times["Trans_eval_time"] += eval_time
-        logger.add_scalar("time/Trans_eval_time", eval_time, global_step)
-            
-            
-                    
+        logger.add_scalar("Trans/Trans_eval_time", eval_time, global_step)
+        logger.add_scalar("Trans/Trans_eval_sr_once", eval_metrics_mean['success_once'], global_step)
+        logger.add_scalar("Trans/Trans_eval_return", eval_metrics_mean['return'], global_step)        
+        
+        
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -1033,7 +859,6 @@ if __name__ == "__main__":
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, human_render_camera_configs=dict(shader_pack="default"), **env_kwargs)
     trans_eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, human_render_camera_configs=dict(shader_pack="default"), **env_kwargs)
-    
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
@@ -1047,7 +872,6 @@ if __name__ == "__main__":
             save_video_trigger = lambda x : (x // args.num_steps) % args.save_train_video_freq == 0
             envs = RecordEpisode(envs, output_dir=f"runs/{run_name}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=30)
         eval_envs = RecordEpisode(eval_envs, output_dir=eval_output_dir, save_trajectory=args.save_trajectory, save_video=args.capture_video, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=30)
-        trans_eval_envs = RecordEpisode(trans_eval_envs, output_dir=eval_output_dir, save_trajectory=args.save_trajectory, save_video=args.capture_video, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=30)
     envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
     eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
     trans_eval_envs = ManiSkillVectorEnv(trans_eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
@@ -1106,12 +930,13 @@ if __name__ == "__main__":
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
         alpha = args.alpha
-        
-        
-    
-        
-        
 
+    trans_actor = Trans_Actor(envs).to(device)
+    trans_qf1 = Trans_SoftQNetwork(envs).to(device)
+    trans_qf2 = Trans_SoftQNetwork(envs).to(device)
+    trans_q_optimizer = optim.Adam(list(trans_qf1.parameters()) + list(trans_qf2.parameters()), lr=args.q_lr)
+    trans_actor_optimizer = optim.Adam(list(trans_actor.parameters()), lr=args.policy_lr)
+    
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
         env=envs,
@@ -1120,12 +945,11 @@ if __name__ == "__main__":
         storage_device=torch.device(args.buffer_device),
         sample_device=device
     )
-    
+
 
     # TRY NOT TO MODIFY: start the game
     obs, info = envs.reset(seed=args.seed) # in Gymnasium, seed is given to reset() instead of seed()
     eval_obs, _ = eval_envs.reset(seed=args.seed)
-    #trans_eval_obs, _ = trans_eval_envs.reset(seed=args.seed)
     global_step = 0
     global_update = 0
     learning_has_started = False
@@ -1133,41 +957,6 @@ if __name__ == "__main__":
     global_steps_per_iteration = args.num_envs * (args.steps_per_env)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     cumulative_times = defaultdict(float)
-    
-    
-    # TRANSFORMER INITIALIZATION BELOW
-    trans_actor = Trans_Actor(envs=eval_envs, args=args, sample_obs=obs).to(device)
-    trans_qf1 = Trans_SoftQNetwork(eval_envs, args, trans_actor.encoder).to(device)
-    trans_qf2 = Trans_SoftQNetwork(eval_envs, args, trans_actor.encoder).to(device)
-        
-    trans_qf1_target = Trans_SoftQNetwork(eval_envs, args, trans_actor.encoder).to(device)
-    trans_qf2_target = Trans_SoftQNetwork(eval_envs, args, trans_actor.encoder).to(device)
-        
-    trans_q_optimizer = optim.Adam(
-                        list(trans_qf1.transformer.parameters()) +
-                        list(trans_qf2.transformer.parameters()) +
-                        list(trans_qf1.net.parameters()) +
-                        list(trans_qf2.net.parameters()) +
-                        list(trans_qf1.encoder.parameters()),
-                        lr=3e-4)
-    trans_actor_optimizer = optim.Adam(list(trans_actor.parameters()), lr=3e-4)
-        
-    # Automatic entropy tuning
-    if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
-        trans_a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
-    else:
-        alpha = args.alpha
-
-    # TRANSFORMER INITIALIZATION ABOVE
-    
-    
-
-        
-        
-    
 
     while global_step < args.total_timesteps:
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
@@ -1180,18 +969,19 @@ if __name__ == "__main__":
             positions = []
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
-                    
                     eval_actions = actor.get_eval_action(eval_obs)
                     eval_actions = eval_actions.detach()
-                    eval_next_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(eval_actions)
                     
-                    #### PUT DATA INTO RB FOR TRANS TRAINING 
-                    real_next_obs = {k: v.clone() for k, v in eval_next_obs.items()}
+                    eval_next_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(eval_actions)
+                    real_next_obs = eval_next_obs
+                    
                     stop_bootstrap = torch.zeros_like(eval_terminations, dtype=torch.bool)
                     pos = rb.add(eval_obs, real_next_obs, eval_actions, eval_rew, stop_bootstrap)
                     positions.append(pos)
-                    
+
+                    # Обновляем obs на следующий шаг
                     eval_obs = eval_next_obs
+                    
                     
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
@@ -1204,13 +994,11 @@ if __name__ == "__main__":
                 eval_metrics_mean[k] = mean
                 if logger is not None:
                     logger.add_scalar(f"eval/{k}", mean, global_step)
-            
-            
-            # add associated reward and Q,V into rb
+                    
+            print(positions)
             rb.add_associated_reward(positions, eval_metrics['return'][0])
-            rb.add_qv_estimates(positions)
-            
-            
+            rb.add_qv_estimates(positions)                    
+                    
             pbar.set_description(
                 f"success_once: {eval_metrics_mean['success_once']:.2f}, "
                 f"return: {eval_metrics_mean['return']:.2f}"
@@ -1221,9 +1009,6 @@ if __name__ == "__main__":
                 logger.add_scalar("time/eval_time", eval_time, global_step)
             if args.evaluate:
                 break
-            
-            train_transformer(loss_proportion=1, positions=positions, ascent_on='transformer', batch_size=10, context=5, shuffle=True)
-            
             actor.train()
 
             # if args.save_model:
@@ -1236,6 +1021,10 @@ if __name__ == "__main__":
             #     }, model_path)
             #     print(f"model saved to {model_path}")
 
+            train_transformer(loss_proportion=1, positions=positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
+            evaluate_transformer()
+        
+        
         # Collect samples from environemnts
         rollout_time = time.perf_counter()
         for local_step in range(args.steps_per_env):
