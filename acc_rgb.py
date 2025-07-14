@@ -203,6 +203,70 @@ class DictArray(object):
                 new_dict[k] = v.reshape(shape + v.shape[t:])
         new_buffer_shape = next(iter(new_dict.values())).shape[:len(shape)]
         return DictArray(new_buffer_shape, None, data_dict=new_dict)
+# @dataclass
+# class ReplayBufferSample:
+#     obs: torch.Tensor
+#     next_obs: torch.Tensor
+#     actions: torch.Tensor
+#     rewards: torch.Tensor
+#     dones: torch.Tensor
+# class ReplayBuffer:
+#     def __init__(self, env, num_envs: int, buffer_size: int, storage_device: torch.device, sample_device: torch.device):
+#         self.buffer_size = buffer_size
+#         self.pos = 0
+#         self.full = False
+#         self.num_envs = num_envs
+#         self.storage_device = storage_device
+#         self.sample_device = sample_device
+#         self.per_env_buffer_size = buffer_size // num_envs
+#         # note 128x128x3 RGB data with replay buffer size 100_000 takes up around 4.7GB of GPU memory
+#         # 32 parallel envs with rendering uses up around 2.2GB of GPU memory.
+#         self.obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
+#         # TODO (stao): optimize final observation storage
+#         self.next_obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
+#         self.actions = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_action_space.shape, device=storage_device)
+#         self.logprobs = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+#         self.rewards = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+#         self.dones = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+#         self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+
+#     def add(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
+#         if self.storage_device == torch.device("cpu"):
+#             obs = {k: v.cpu() for k, v in obs.items()}
+#             next_obs = {k: v.cpu() for k, v in next_obs.items()}
+#             action = action.cpu()
+#             reward = reward.cpu()
+#             done = done.cpu()
+
+#         self.obs[self.pos] = obs
+#         self.next_obs[self.pos] = next_obs
+
+#         self.actions[self.pos] = action
+#         self.rewards[self.pos] = reward
+#         self.dones[self.pos] = done
+
+#         self.pos += 1
+#         if self.pos == self.per_env_buffer_size:
+#             self.full = True
+#             self.pos = 0
+#     def sample(self, batch_size: int):
+#         if self.full:
+#             batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size, ))
+#         else:
+#             batch_inds = torch.randint(0, self.pos, size=(batch_size, ))
+#         env_inds = torch.randint(0, self.num_envs, size=(batch_size, ))
+#         obs_sample = self.obs[batch_inds, env_inds]
+#         next_obs_sample = self.next_obs[batch_inds, env_inds]
+#         obs_sample = {k: v.to(self.sample_device) for k, v in obs_sample.items()}
+#         next_obs_sample = {k: v.to(self.sample_device) for k, v in next_obs_sample.items()}
+#         return ReplayBufferSample(
+#             obs=obs_sample,
+#             next_obs=next_obs_sample,
+#             actions=self.actions[batch_inds, env_inds].to(self.sample_device),
+#             rewards=self.rewards[batch_inds, env_inds].to(self.sample_device),
+#             dones=self.dones[batch_inds, env_inds].to(self.sample_device)
+#         )
+
 @dataclass
 class ReplayBufferSample:
     obs: torch.Tensor
@@ -215,70 +279,7 @@ class ReplayBuffer:
         self.buffer_size = buffer_size
         self.pos = 0
         self.full = False
-        self.num_envs = num_envs
-        self.storage_device = storage_device
-        self.sample_device = sample_device
-        self.per_env_buffer_size = buffer_size // num_envs
-        # note 128x128x3 RGB data with replay buffer size 100_000 takes up around 4.7GB of GPU memory
-        # 32 parallel envs with rendering uses up around 2.2GB of GPU memory.
-        self.obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
-        # TODO (stao): optimize final observation storage
-        self.next_obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
-        self.actions = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_action_space.shape, device=storage_device)
-        self.logprobs = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.rewards = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.dones = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-
-    def add(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
-        if self.storage_device == torch.device("cpu"):
-            obs = {k: v.cpu() for k, v in obs.items()}
-            next_obs = {k: v.cpu() for k, v in next_obs.items()}
-            action = action.cpu()
-            reward = reward.cpu()
-            done = done.cpu()
-
-        self.obs[self.pos] = obs
-        self.next_obs[self.pos] = next_obs
-
-        self.actions[self.pos] = action
-        self.rewards[self.pos] = reward
-        self.dones[self.pos] = done
-
-        self.pos += 1
-        if self.pos == self.per_env_buffer_size:
-            self.full = True
-            self.pos = 0
-    def sample(self, batch_size: int):
-        if self.full:
-            batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size, ))
-        else:
-            batch_inds = torch.randint(0, self.pos, size=(batch_size, ))
-        env_inds = torch.randint(0, self.num_envs, size=(batch_size, ))
-        obs_sample = self.obs[batch_inds, env_inds]
-        next_obs_sample = self.next_obs[batch_inds, env_inds]
-        obs_sample = {k: v.to(self.sample_device) for k, v in obs_sample.items()}
-        next_obs_sample = {k: v.to(self.sample_device) for k, v in next_obs_sample.items()}
-        return ReplayBufferSample(
-            obs=obs_sample,
-            next_obs=next_obs_sample,
-            actions=self.actions[batch_inds, env_inds].to(self.sample_device),
-            rewards=self.rewards[batch_inds, env_inds].to(self.sample_device),
-            dones=self.dones[batch_inds, env_inds].to(self.sample_device)
-        )
-
-@dataclass
-class ReplayBufferSample:
-    obs: torch.Tensor
-    next_obs: torch.Tensor
-    actions: torch.Tensor
-    rewards: torch.Tensor
-    dones: torch.Tensor
-class ReplayBuffer:
-    def __init__(self, env, num_envs: int, buffer_size: int, storage_device: torch.device, sample_device: torch.device):
-        self.buffer_size = buffer_size
-        self.pos = 0
-        self.full = False
+        self.env = env
         self.num_envs = num_envs
         self.storage_device = storage_device
         self.sample_device = sample_device
@@ -368,7 +369,9 @@ class ReplayBuffer:
             action = action.cpu()
             reward = reward.cpu()
             done = done.cpu()
-
+        if self.pos+args.num_steps >= self.per_env_buffer_size:
+            self.pos = 0
+        
         self.obs[self.pos] = obs
         self.next_obs[self.pos] = next_obs
 
@@ -1061,6 +1064,9 @@ class PlainConv(nn.Module):
         x = self.cnn(image)
         if self.pool is not None:
             x = self.pool(x)
+        
+        
+        #print(x.shape)
         x = x.flatten(1)
         x = self.fc(x)
         return x
@@ -1159,7 +1165,7 @@ class SoftQNetwork(nn.Module):
         if visual_feature is None:
             visual_feature = self.encoder(obs)
         if detach_encoder:
-            visual_feature = visual_feature.detach()
+            visual_feature = visual_feature.detach()    
         x = torch.cat([visual_feature, obs["state"], action], dim=1)
         return self.mlp(x)
 
@@ -1276,6 +1282,8 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         predicted_action, _, _, _ = trans_actor.get_action({'state': obs_s, 'rgb': obs_i})
         target_action = acts[:, -1].clone()  
         criterion = nn.MSELoss()
+        
+        #print(f'a bc {predicted_action.shape, target_action.shape}')
         trans_actor_BC_loss = criterion(predicted_action, target_action)
         
         trans_actor_optimizer.zero_grad()
@@ -1294,6 +1302,7 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
             q_target1 = qf1({'state': obs_s[:, -1].clone(), 'rgb': obs_i[:, -1].clone()}, action_target)
             q_target2 = qf2({'state': obs_s[:, -1].clone(), 'rgb': obs_i[:, -1].clone()}, action_target)
 
+        #print(f'c bc {q_predicted1.shape, q_predicted1.shape}')
         trans_qf1_loss = F.mse_loss(q_predicted1, q_target1)
         trans_qf2_loss = F.mse_loss(q_predicted2, q_target2)
         trans_critic_BC_loss = trans_qf1_loss + trans_qf2_loss
@@ -1304,23 +1313,24 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         
         
         #ACTOR RL LOSS
-        # pi, log_pi, _, visual_feature = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
+        pi, log_pi, _, visual_feature = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
         
-        # pi_detached = pi.clone()
-        # if ascent_on == 'transformer':
-        #     qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
-        #     qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
-        # elif ascent_on == 'accelerator':
-        #     qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
-        #     qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
+        pi_detached = pi.clone()
+        if ascent_on == 'transformer':
+            qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
+            qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
+        elif ascent_on == 'accelerator':
+            print(obs_s.shape, obs_i.shape)
+            qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
+            qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
         
-        # min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
-        # #print(f"ACTOR RL LOSS: {min_qf_pi.shape} vs {log_pi.shape}")
-        # trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
+        min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
         
-        # trans_actor_optimizer.zero_grad()
-        # trans_actor_RL_loss.backward()
-        # trans_actor_optimizer.step()
+        trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
+        
+        trans_actor_optimizer.zero_grad()
+        trans_actor_RL_loss.backward()
+        trans_actor_optimizer.step()
         
         #CRITIC RL LOSS
         '''
@@ -1328,25 +1338,28 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         но потом при файнтюне он снова понадобится так как у нас больше не будет R
         таргеты можно сразу убрать и на момент файнтюна инициализировать копиями критиков
         '''
-        # Q_target = Q[:, -1].clone()
-        # action_target = acts[:, -1].clone()
+        Q_target = Q[:, -1].clone()
+        action_target = acts[:, -1].clone()
 
-        # qf1_a_values = trans_qf1({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
-        # qf2_a_values = trans_qf2({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
+        qf1_a_values = trans_qf1({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
+        qf2_a_values = trans_qf2({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
 
-        # qf1_loss = F.mse_loss(qf1_a_values, Q_target)
-        # qf2_loss = F.mse_loss(qf2_a_values, Q_target)
-        # trans_critic_RL_loss = qf1_loss + qf2_loss
+        #print(f'c rl {qf1_a_values.shape, Q_target.shape}')
+        qf1_loss = F.mse_loss(qf1_a_values, Q_target)
+        qf2_loss = F.mse_loss(qf2_a_values, Q_target)
+        trans_critic_RL_loss = qf1_loss + qf2_loss
         
-        # trans_q_optimizer.zero_grad()
-        # trans_critic_RL_loss.backward()
-        # trans_q_optimizer.step()
+        trans_q_optimizer.zero_grad()
+        trans_critic_RL_loss.backward()
+        trans_q_optimizer.step()
         
         
     duration = time.time() - start_time
     print(f"Transformer training completed in {duration:.2f} seconds.")
     logger.add_scalar("Trans/Actor_BC_loss", trans_actor_BC_loss.item(), global_step)
-    logger.add_scalar("Trans/Critic_BC_loss", trans_critic_BC_loss.item(), global_step)
+    logger.add_scalar("Trans/Critic_BC_loss", trans_critic_BC_loss.item(), global_step) 
+    logger.add_scalar("Trans/Critic_RL_loss", trans_critic_RL_loss.item(), global_step)
+    logger.add_scalar("Trans/Actor_RL_loss", trans_actor_RL_loss.item(), global_step)
         
         
             
@@ -1413,7 +1426,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"REAL_ACCELERATOR/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"REAL_ACCELERATOR/RL_BC_{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
