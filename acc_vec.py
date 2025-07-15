@@ -7,6 +7,7 @@ import time
 from typing import Optional
 from torch.utils.data import TensorDataset, DataLoader
 import tqdm
+import math
 
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
@@ -43,7 +44,7 @@ class Args:
     """the entity (team) of wandb's project"""
     wandb_group: str = "SAC"
     """the group of the run for wandb"""
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_trajectory: bool = False
     """whether to save trajectory data into the `videos` folder"""
@@ -137,6 +138,8 @@ class Args:
     dropout: float = 0.0
     seq_len: int = 5
     bias: bool = True
+    loss_proportion: str = 'bc'
+    use_train_data: bool = True
     
 
 @dataclass
@@ -157,6 +160,7 @@ class ReplayBuffer:
         self.storage_device = storage_device
         self.sample_device = sample_device
         self.per_env_buffer_size = buffer_size // num_envs
+        print(self.per_env_buffer_size)
 
         # основной буфер
         self.obs          = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_observation_space.shape, device=storage_device)
@@ -170,6 +174,47 @@ class ReplayBuffer:
         self.Q            = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
         self.V            = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
 
+    
+    def add(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
+        if self.storage_device == torch.device("cpu"):
+            obs = obs.cpu()
+            next_obs = next_obs.cpu()
+            action = action.cpu()
+            reward = reward.cpu()
+            done = done.cpu()
+        
+        if self.pos+args.num_steps >= self.per_env_buffer_size+2:
+            self.pos = 0
+            
+        self.obs[self.pos] = obs
+        self.next_obs[self.pos] = next_obs
+
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.dones[self.pos] = done
+
+        self.pos += 1
+        if self.pos == self.per_env_buffer_size:
+            self.full = True
+            self.pos = 0
+            
+        return self.pos-1    
+    
+    def sample(self, batch_size: int):
+        if self.full:
+            batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size, ))
+        else:
+            batch_inds = torch.randint(0, self.pos, size=(batch_size, ))
+        env_inds = torch.randint(0, self.num_envs, size=(batch_size, ))
+        return ReplayBufferSample(
+            obs=self.obs[batch_inds, env_inds].to(self.sample_device),
+            next_obs=self.next_obs[batch_inds, env_inds].to(self.sample_device),
+            actions=self.actions[batch_inds, env_inds].to(self.sample_device),
+            rewards=self.rewards[batch_inds, env_inds].to(self.sample_device),
+            dones=self.dones[batch_inds, env_inds].to(self.sample_device)
+        )
+    
+    
     def add_associated_reward(self, positions: list[int], rewards: torch.Tensor):
         """
         Добавляет associated_r, корректно обрабатывая wrap-around.
@@ -683,11 +728,11 @@ class Logger:
         self.writer.close()
         
 
-def train_transformer(loss_proportion: int, positions: list, ascent_on: str, batch_size: int, context: int, shuffle: bool):
+def train_transformer(loss_proportion: str, positions: list, ascent_on: str, batch_size: int, context: int, shuffle: bool):
     
     '''
-    obs_s     torch.Size([bs, cont, s_d]) 
-    n_obs   torch.Size([bs, cont, s_d]) 
+    obs       torch.Size([bs, cont, s_d]) 
+    n_obs     torch.Size([bs, cont, s_d]) 
     acts      torch.Size([bs, cont, 4]) 
     rew       torch.Size([bs, cont]) 
     dones     torch.Size([bs, cont]) 
@@ -707,82 +752,93 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         R = batch[5]  # Associated rewards with the episode under the positions
         Q = batch[6]  # Real Q values associated with states and observation on the positions
         V = batch[7]  # Real V values
-    
-        #ACTOR BC LOSS
-        predicted_action, _, _, _ = trans_actor.get_action(obs)
-        target_action = acts[:, -1].clone()  
-        criterion = nn.MSELoss()
-        trans_actor_BC_loss = criterion(predicted_action, target_action)
-        
-        trans_actor_optimizer.zero_grad()
-        trans_actor_BC_loss.backward()
-        trans_actor_optimizer.step()
-        
-        
-        # CRITIC BC LOSS
-        action_target = acts[:, -1].clone()
 
-        q_predicted1 = trans_qf1(obs, action_target)
-        q_predicted2 = trans_qf2(obs, action_target)
+        
+        if loss_proportion in ['rl+bc', 'bc']:        
+        
+            #ACTOR BC LOSS
+            predicted_action, _, _= trans_actor.get_action(obs)
+            target_action = acts[:, -1].clone()  
+            criterion = nn.MSELoss()
+            trans_actor_BC_loss = criterion(predicted_action, target_action)
+            
+            trans_actor_optimizer.zero_grad()
+            trans_actor_BC_loss.backward()
+            trans_actor_optimizer.step()
+            
+            
+            # CRITIC BC LOSS
+            action_target = acts[:, -1].clone()
 
-        # Only last timestep
-        with torch.no_grad():
-            q_target1 = qf1(obs, action_target)
-            q_target2 = qf2(obs, action_target)
+            q_predicted1 = trans_qf1(obs, action_target)
+            q_predicted2 = trans_qf2(obs, action_target)
 
-        trans_qf1_loss = F.mse_loss(q_predicted1, q_target1)
-        trans_qf2_loss = F.mse_loss(q_predicted2, q_target2)
-        trans_critic_BC_loss = trans_qf1_loss + trans_qf2_loss
-        
-        trans_q_optimizer.zero_grad()
-        trans_critic_BC_loss.backward()
-        trans_q_optimizer.step()
-        
-        
-        #ACTOR RL LOSS
-        # pi, log_pi, _, visual_feature = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
-        
-        # pi_detached = pi.clone()
-        # if ascent_on == 'transformer':
-        #     qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
-        #     qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
-        # elif ascent_on == 'accelerator':
-        #     qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
-        #     qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
-        
-        # min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
-        # #print(f"ACTOR RL LOSS: {min_qf_pi.shape} vs {log_pi.shape}")
-        # trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
-        
-        # trans_actor_optimizer.zero_grad()
-        # trans_actor_RL_loss.backward()
-        # trans_actor_optimizer.step()
-        
-        #CRITIC RL LOSS
-        '''
-        пересчёт R позволяет в том числе ещё и убрать второго критика (на момент разгона)
-        но потом при файнтюне он снова понадобится так как у нас больше не будет R
-        таргеты можно сразу убрать и на момент файнтюна инициализировать копиями критиков
-        '''
-        # Q_target = Q[:, -1].clone()
-        # action_target = acts[:, -1].clone()
+            # Only last timestep
+            with torch.no_grad():
+                q_target1 = qf1(obs[:,-1,], action_target)
+                q_target2 = qf2(obs[:,-1,], action_target)
 
-        # qf1_a_values = trans_qf1({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
-        # qf2_a_values = trans_qf2({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
+            trans_qf1_loss = F.mse_loss(q_predicted1, q_target1)
+            trans_qf2_loss = F.mse_loss(q_predicted2, q_target2)
+            trans_critic_BC_loss = trans_qf1_loss + trans_qf2_loss
+            
+            trans_q_optimizer.zero_grad()
+            trans_critic_BC_loss.backward()
+            trans_q_optimizer.step()
 
-        # qf1_loss = F.mse_loss(qf1_a_values, Q_target)
-        # qf2_loss = F.mse_loss(qf2_a_values, Q_target)
-        # trans_critic_RL_loss = qf1_loss + qf2_loss
+            logger.add_scalar("Trans/Actor_BC_loss", trans_actor_BC_loss.item(), global_step)
+            logger.add_scalar("Trans/Critic_BC_loss", trans_critic_BC_loss.item(), global_step)
         
-        # trans_q_optimizer.zero_grad()
-        # trans_critic_RL_loss.backward()
-        # trans_q_optimizer.step()
+        if loss_proportion in ['rl+bc', 'rl']: 
+        
+            #ACTOR RL LOSS
+            pi, log_pi, _ = trans_actor.get_action(obs)
+            
+            pi_detached = pi.clone() #?????????????
+            if ascent_on == 'transformer':
+                qf1_pi = trans_qf1(obs , pi_detached) #detach_encoder=True
+                qf2_pi = trans_qf2(obs , pi_detached) #detach_encoder=True
+            elif ascent_on == 'accelerator':
+                qf1_pi = qf1(obs[:,-1,], pi_detached) #detach_encoder=True
+                qf2_pi = qf2(obs[:,-1,], pi_detached) #detach_encoder=True
+            
+            min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
+            
+            trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
+            
+            trans_actor_optimizer.zero_grad()
+            trans_actor_RL_loss.backward()
+            trans_actor_optimizer.step()
+            
+            #CRITIC RL LOSS
+            '''
+            пересчёт R позволяет в том числе ещё и убрать второго критика (на момент разгона)
+            но потом при файнтюне он снова понадобится так как у нас больше не будет R
+            таргеты можно сразу убрать и на момент файнтюна инициализировать копиями критиков
+            '''
+            Q_target = Q[:, -1].clone()
+            action_target = acts[:, -1].clone()
+
+            qf1_a_values = trans_qf1(obs, action_target).reshape(-1)
+            qf2_a_values = trans_qf2(obs, action_target).reshape(-1)
+
+            qf1_loss = F.mse_loss(qf1_a_values, Q_target)
+            qf2_loss = F.mse_loss(qf2_a_values, Q_target)
+            trans_critic_RL_loss = qf1_loss + qf2_loss
+            
+            trans_q_optimizer.zero_grad()
+            trans_critic_RL_loss.backward()
+            trans_q_optimizer.step()
+            
+            logger.add_scalar("Trans/Actor_RL_loss", trans_actor_RL_loss.item(), global_step)
+            logger.add_scalar("Trans/Critic_RL_loss", trans_critic_RL_loss.item(), global_step)
         
         
     duration = time.time() - start_time
     print(f"Transformer training completed in {duration:.2f} seconds.")
-    logger.add_scalar("Trans/Actor_BC_loss", trans_actor_BC_loss.item(), global_step)
-    logger.add_scalar("Trans/Critic_BC_loss", trans_critic_BC_loss.item(), global_step)
+    
+    
+    
         
         
             
@@ -807,7 +863,7 @@ def evaluate_transformer():
         
         
         with torch.no_grad():
-            eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(actor.get_eval_action(eval_observations))
+            eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(trans_actor.get_eval_action(eval_observations))
             eval_observations = torch.cat([eval_observations, eval_obs.unsqueeze(1)], dim=1)
             rew_list.append(eval_rew.cpu().numpy().tolist())
             if "final_info" in eval_infos:
@@ -840,7 +896,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"VECTOR_ACCELERATOR/{args.env_id}|regime={args.loss_proportion}|UTD{args.use_train_data}|__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
@@ -878,6 +934,8 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
+    args.max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env) 
+    
     logger = None
     if not args.evaluate:
         print("Running training")
@@ -931,9 +989,9 @@ if __name__ == "__main__":
     else:
         alpha = args.alpha
 
-    trans_actor = Trans_Actor(envs).to(device)
-    trans_qf1 = Trans_SoftQNetwork(envs).to(device)
-    trans_qf2 = Trans_SoftQNetwork(envs).to(device)
+    trans_actor = Trans_Actor(envs, args).to(device)
+    trans_qf1 = Trans_SoftQNetwork(envs, args).to(device)
+    trans_qf2 = Trans_SoftQNetwork(envs, args).to(device)
     trans_q_optimizer = optim.Adam(list(trans_qf1.parameters()) + list(trans_qf2.parameters()), lr=args.q_lr)
     trans_actor_optimizer = optim.Adam(list(trans_actor.parameters()), lr=args.policy_lr)
     
@@ -957,7 +1015,7 @@ if __name__ == "__main__":
     global_steps_per_iteration = args.num_envs * (args.steps_per_env)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     cumulative_times = defaultdict(float)
-
+    rollout_positions = []      
     while global_step < args.total_timesteps:
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # evaluate
@@ -1027,7 +1085,10 @@ if __name__ == "__main__":
         
         # Collect samples from environemnts
         rollout_time = time.perf_counter()
+        
+        
         for local_step in range(args.steps_per_env):
+            
             global_step += 1 * args.num_envs
 
             # ALGO LOGIC: put action logic here
@@ -1057,18 +1118,27 @@ if __name__ == "__main__":
                 for k, v in final_info["episode"].items():
                     logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
 
-            rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
-
+            pos = rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
+            rollout_positions.append(pos)
+            
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             obs = next_obs
         rollout_time = time.perf_counter() - rollout_time
         cumulative_times["rollout_time"] += rollout_time
         pbar.update(args.num_envs * args.steps_per_env)
-
+        
+        
+        
         # ALGO LOGIC: training.
         if global_step < args.learning_starts:
             continue
-
+        
+        if len(rollout_positions) >= 50:
+            print('rollout_positions')
+            print(rollout_positions)
+            train_transformer(loss_proportion=args.loss_proportion, positions=rollout_positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
+            rollout_positions = []
+            
         update_time = time.perf_counter()
         learning_has_started = True
         for local_update in range(args.grad_steps_per_iteration):

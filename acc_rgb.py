@@ -1317,12 +1317,12 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         
         pi_detached = pi.clone()
         if ascent_on == 'transformer':
-            qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
-            qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature, detach_encoder=True)
+            qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature)  ##  detach_encoder=True ???????
+            qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature)##  detach_encoder=True ???????
         elif ascent_on == 'accelerator':
             print(obs_s.shape, obs_i.shape)
-            qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
-            qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature, detach_encoder=True)
+            qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature)##  detach_encoder=True ???????
+            qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature)##  detach_encoder=True ???????
         
         min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
         
