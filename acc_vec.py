@@ -62,9 +62,9 @@ class Args:
     """the id of the environment"""
     env_vectorization: str = "gpu"
     """the type of environment vectorization to use"""
-    num_envs: int = 16
+    num_envs: int = 32
     """the number of parallel environments"""
-    num_eval_envs: int = 16
+    num_eval_envs: int = 32
     """the number of parallel evaluation environments"""
     partial_reset: bool = False
     """whether to let parallel environments reset upon termination instead of truncation"""
@@ -796,11 +796,11 @@ def train_transformer(loss_proportion: str, positions: list, ascent_on: str, bat
             
             pi_detached = pi.clone() #?????????????
             if ascent_on == 'transformer':
-                qf1_pi = trans_qf1(obs , pi_detached) #detach_encoder=True
-                qf2_pi = trans_qf2(obs , pi_detached) #detach_encoder=True
+                qf1_pi = trans_qf1(obs , pi_detached) #detach_encoder=True 
+                qf2_pi = trans_qf2(obs , pi_detached) #detach_encoder=True 
             elif ascent_on == 'accelerator':
-                qf1_pi = qf1(obs[:,-1,], pi_detached) #detach_encoder=True
-                qf2_pi = qf2(obs[:,-1,], pi_detached) #detach_encoder=True
+                qf1_pi = qf1(obs[:,-1,], pi_detached) #detach_encoder=True 
+                qf2_pi = qf2(obs[:,-1,], pi_detached) #detach_encoder=True 
             
             min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
             
@@ -816,14 +816,24 @@ def train_transformer(loss_proportion: str, positions: list, ascent_on: str, bat
             но потом при файнтюне он снова понадобится так как у нас больше не будет R
             таргеты можно сразу убрать и на момент файнтюна инициализировать копиями критиков
             '''
-            Q_target = Q[:, -1].clone()
+            #Q_target = Q[:, -1].clone()
             action_target = acts[:, -1].clone()
+            
+            with torch.no_grad():
+                next_state_actions, next_state_log_pi, _ = actor.get_action( n_obs[:,-1,] )  # a* = \pi(s') 
+                #print(f"Из n_obs {n_obs.shape} получили next_state_actions {next_state_actions.shape}")
+                qf1_next_target = trans_qf1_target(n_obs, next_state_actions)
+                qf2_next_target = trans_qf2_target(n_obs, next_state_actions)   # Q(s',a*)
+                #print(f"Транс таргет критики выдали  {qf2_next_target.shape},next_state_log_pi={next_state_log_pi.shape}")
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                #print(f"rew {rew.shape} dones.flatten() {dones.shape}, min_qf_next_target={min_qf_next_target.shape}")
+                next_q_value = rew[:,-1] + (1 - dones[:,-1]) * args.gamma * (min_qf_next_target).view(-1)
 
             qf1_a_values = trans_qf1(obs, action_target).reshape(-1)
             qf2_a_values = trans_qf2(obs, action_target).reshape(-1)
 
-            qf1_loss = F.mse_loss(qf1_a_values, Q_target)
-            qf2_loss = F.mse_loss(qf2_a_values, Q_target)
+            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             trans_critic_RL_loss = qf1_loss + qf2_loss
             
             trans_q_optimizer.zero_grad()
@@ -832,6 +842,12 @@ def train_transformer(loss_proportion: str, positions: list, ascent_on: str, bat
             
             logger.add_scalar("Trans/Actor_RL_loss", trans_actor_RL_loss.item(), global_step)
             logger.add_scalar("Trans/Critic_RL_loss", trans_critic_RL_loss.item(), global_step)
+        
+        if trans_global_update % args.target_network_frequency == 0:
+            for param, target_param in zip(trans_qf1.parameters(), trans_qf1_target.parameters()):
+                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+            for param, target_param in zip(trans_qf2.parameters(), trans_qf2_target.parameters()):
+                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
         
         
     duration = time.time() - start_time
@@ -896,7 +912,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"VECTOR_ACCELERATOR/{args.env_id}|regime={args.loss_proportion}|UTD{args.use_train_data}|__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"ECAI_CAMERA_READY_VEC/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
@@ -992,6 +1008,10 @@ if __name__ == "__main__":
     trans_actor = Trans_Actor(envs, args).to(device)
     trans_qf1 = Trans_SoftQNetwork(envs, args).to(device)
     trans_qf2 = Trans_SoftQNetwork(envs, args).to(device)
+    trans_qf1_target = Trans_SoftQNetwork(envs, args).to(device)
+    trans_qf2_target = Trans_SoftQNetwork(envs, args).to(device)
+    trans_qf1_target.load_state_dict(trans_qf1.state_dict())
+    trans_qf2_target.load_state_dict(trans_qf2.state_dict())
     trans_q_optimizer = optim.Adam(list(trans_qf1.parameters()) + list(trans_qf2.parameters()), lr=args.q_lr)
     trans_actor_optimizer = optim.Adam(list(trans_actor.parameters()), lr=args.policy_lr)
     
@@ -1010,6 +1030,7 @@ if __name__ == "__main__":
     eval_obs, _ = eval_envs.reset(seed=args.seed)
     global_step = 0
     global_update = 0
+    trans_global_update = 0
     learning_has_started = False
 
     global_steps_per_iteration = args.num_envs * (args.steps_per_env)
@@ -1017,6 +1038,21 @@ if __name__ == "__main__":
     cumulative_times = defaultdict(float)
     rollout_positions = []      
     while global_step < args.total_timesteps:
+        
+        if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
+                evaluate_transformer()
+                
+                model_path = f"ECAI_CAMERA_READY_WEIGHTS_VEC/{args.env_id}/seed_{args.seed}|ckpt_{global_step}.pt"
+                torch.save({
+                    'trans_actor': trans_actor.state_dict(),
+                    'trans_qf1': trans_qf1.state_dict(),
+                    'trans_qf2': trans_qf1.state_dict(),
+                    'qf1': qf1_target.state_dict(),
+                    'qf2': qf2_target.state_dict(),
+                    'log_alpha': log_alpha,
+                }, model_path)
+                print(f"trans saved to {model_path}")
+        
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # evaluate
             actor.eval()
@@ -1053,7 +1089,7 @@ if __name__ == "__main__":
                 if logger is not None:
                     logger.add_scalar(f"eval/{k}", mean, global_step)
                     
-            print(positions)
+            #print(positions)
             rb.add_associated_reward(positions, eval_metrics['return'][0])
             rb.add_qv_estimates(positions)                    
                     
@@ -1078,9 +1114,10 @@ if __name__ == "__main__":
             #         'log_alpha': log_alpha,
             #     }, model_path)
             #     print(f"model saved to {model_path}")
-
-            train_transformer(loss_proportion=1, positions=positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
-            evaluate_transformer()
+            
+            train_transformer(loss_proportion='bc', positions=positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
+            trans_global_update += 1
+            #evaluate_transformer()
         
         
         # Collect samples from environemnts
@@ -1119,7 +1156,7 @@ if __name__ == "__main__":
                     logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
 
             pos = rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
-            rollout_positions.append(pos)
+            #rollout_positions.append(pos)
             
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             obs = next_obs
@@ -1133,11 +1170,13 @@ if __name__ == "__main__":
         if global_step < args.learning_starts:
             continue
         
-        if len(rollout_positions) >= 50:
-            print('rollout_positions')
-            print(rollout_positions)
-            train_transformer(loss_proportion=args.loss_proportion, positions=rollout_positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
-            rollout_positions = []
+        # if len(rollout_positions) >= 50:
+        #     #print('rollout_positions')
+        #     #print(rollout_positions)
+            
+        #     train_transformer(loss_proportion='bc', positions=rollout_positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
+            
+        #     rollout_positions = []
             
         update_time = time.perf_counter()
         learning_has_started = True

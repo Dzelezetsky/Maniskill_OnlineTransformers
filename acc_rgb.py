@@ -143,7 +143,7 @@ class Args:
     
     use_gates: bool = False
     """use gatings instead skip connection in transformer block"""
-    n_embd: int = 228  #483#256  
+    n_embd: int = 228  #483#256  #228 231
     """inner transformer dimention"""
     n_layer: int = 1
     n_head: int = 2
@@ -604,7 +604,7 @@ class Trans_PlainConv(nn.Module):
     '''
     def __init__(self,
                  in_channels=3,
-                 out_dim=228, #256,
+                 out_dim=228, #228, 231
                  pool_feature_map=False,
                  last_act=True, # True for ConvBody, False for CNN
                  image_size=[128, 128]
@@ -920,7 +920,7 @@ class Trans_Actor(nn.Module):
             image_size = sample_obs["depth"].shape[1:3]
 
         self.encoder = Trans_EncoderObsWrapper(
-            Trans_PlainConv(in_channels=in_channels, out_dim=228, image_size=image_size) # assume image is 64x64
+            Trans_PlainConv(in_channels=in_channels, out_dim=228, image_size=image_size) #  231
         )
         inner_size = self.encoder.encoder.out_dim+self.state_dim
         self.fc_mean = nn.Linear(inner_size, action_dim)
@@ -1313,53 +1313,53 @@ def train_transformer(loss_proportion: int, positions: list, ascent_on: str, bat
         
         
         #ACTOR RL LOSS
-        pi, log_pi, _, visual_feature = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
+        # pi, log_pi, _, visual_feature = trans_actor.get_action({'state':obs_s,'rgb':obs_i})
         
-        pi_detached = pi.clone()
-        if ascent_on == 'transformer':
-            qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature)  ##  detach_encoder=True ???????
-            qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature)##  detach_encoder=True ???????
-        elif ascent_on == 'accelerator':
-            print(obs_s.shape, obs_i.shape)
-            qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature)##  detach_encoder=True ???????
-            qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature)##  detach_encoder=True ???????
+        # pi_detached = pi.clone()
+        # if ascent_on == 'transformer':
+        #     qf1_pi = trans_qf1({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature)  ##  detach_encoder=True ???????
+        #     qf2_pi = trans_qf2({'state':obs_s,'rgb':obs_i}, pi_detached, visual_feature)##  detach_encoder=True ???????
+        # elif ascent_on == 'accelerator':
+        #     print(obs_s.shape, obs_i.shape)
+        #     qf1_pi = qf1({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature)##  detach_encoder=True ???????
+        #     qf2_pi = qf2({'state':obs_s[:,-1,],'rgb':obs_i[:,-1,]}, pi_detached, visual_feature)##  detach_encoder=True ???????
         
-        min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
+        # min_qf_pi = torch.min(qf1_pi, qf2_pi)#.view(-1)
         
-        trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
+        # trans_actor_RL_loss = ((alpha * log_pi) - min_qf_pi).mean()
         
-        trans_actor_optimizer.zero_grad()
-        trans_actor_RL_loss.backward()
-        trans_actor_optimizer.step()
+        # trans_actor_optimizer.zero_grad()
+        # trans_actor_RL_loss.backward()
+        # trans_actor_optimizer.step()
         
         #CRITIC RL LOSS
-        '''
-        пересчёт R позволяет в том числе ещё и убрать второго критика (на момент разгона)
-        но потом при файнтюне он снова понадобится так как у нас больше не будет R
-        таргеты можно сразу убрать и на момент файнтюна инициализировать копиями критиков
-        '''
-        Q_target = Q[:, -1].clone()
-        action_target = acts[:, -1].clone()
+        # '''
+        # пересчёт R позволяет в том числе ещё и убрать второго критика (на момент разгона)
+        # но потом при файнтюне он снова понадобится так как у нас больше не будет R
+        # таргеты можно сразу убрать и на момент файнтюна инициализировать копиями критиков
+        # '''
+        # Q_target = Q[:, -1].clone()
+        # action_target = acts[:, -1].clone()
 
-        qf1_a_values = trans_qf1({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
-        qf2_a_values = trans_qf2({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
+        # qf1_a_values = trans_qf1({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
+        # qf2_a_values = trans_qf2({'state': obs_s, 'rgb': obs_i}, action_target).reshape(-1)
 
-        #print(f'c rl {qf1_a_values.shape, Q_target.shape}')
-        qf1_loss = F.mse_loss(qf1_a_values, Q_target)
-        qf2_loss = F.mse_loss(qf2_a_values, Q_target)
-        trans_critic_RL_loss = qf1_loss + qf2_loss
+        # #print(f'c rl {qf1_a_values.shape, Q_target.shape}')
+        # qf1_loss = F.mse_loss(qf1_a_values, Q_target)
+        # qf2_loss = F.mse_loss(qf2_a_values, Q_target)
+        # trans_critic_RL_loss = qf1_loss + qf2_loss
         
-        trans_q_optimizer.zero_grad()
-        trans_critic_RL_loss.backward()
-        trans_q_optimizer.step()
+        # trans_q_optimizer.zero_grad()
+        # trans_critic_RL_loss.backward()
+        # trans_q_optimizer.step()
         
         
     duration = time.time() - start_time
     print(f"Transformer training completed in {duration:.2f} seconds.")
     logger.add_scalar("Trans/Actor_BC_loss", trans_actor_BC_loss.item(), global_step)
     logger.add_scalar("Trans/Critic_BC_loss", trans_critic_BC_loss.item(), global_step) 
-    logger.add_scalar("Trans/Critic_RL_loss", trans_critic_RL_loss.item(), global_step)
-    logger.add_scalar("Trans/Actor_RL_loss", trans_actor_RL_loss.item(), global_step)
+    #logger.add_scalar("Trans/Critic_RL_loss", trans_critic_RL_loss.item(), global_step)
+    #logger.add_scalar("Trans/Actor_RL_loss", trans_actor_RL_loss.item(), global_step)
         
         
             
@@ -1426,7 +1426,7 @@ if __name__ == "__main__":
     args.steps_per_env = args.training_freq // args.num_envs
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"REAL_ACCELERATOR/RL_BC_{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"ECAI_CAMERA_READY_RGB/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
@@ -1586,8 +1586,22 @@ if __name__ == "__main__":
     global_steps_per_iteration = args.num_envs * (args.steps_per_env)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     cumulative_times = defaultdict(float)
-
     while global_step < args.total_timesteps:
+        
+        if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
+                evaluate_transformer()
+                
+                model_path = f"ECAI_CAMERA_READY_WEIGHTS/{args.env_id}/seed_{args.seed}|ckpt_{global_step}.pt"
+                torch.save({
+                    'trans_actor': trans_actor.state_dict(),
+                    'trans_qf1': trans_qf1.state_dict(),
+                    'trans_qf2': trans_qf1.state_dict(),
+                    'qf1': qf1_target.state_dict(),
+                    'qf2': qf2_target.state_dict(),
+                    'log_alpha': log_alpha,
+                }, model_path)
+                print(f"trans saved to {model_path}")
+                
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # evaluate
             actor.eval()
@@ -1643,18 +1657,8 @@ if __name__ == "__main__":
             actor.train()
             
             train_transformer(loss_proportion=1, positions=positions, ascent_on='transformer', batch_size=100, context=3, shuffle=True)
-            evaluate_transformer()
             
-
-            # if args.save_model:
-            #     model_path = f"runs/{run_name}/ckpt_{global_step}.pt"
-            #     torch.save({
-            #         'actor': actor.state_dict(),
-            #         'qf1': qf1_target.state_dict(),
-            #         'qf2': qf2_target.state_dict(),
-            #         'log_alpha': log_alpha,
-            #     }, model_path)
-            #     print(f"model saved to {model_path}")
+            
 
         # Collect samples from environemnts
         rollout_time = time.perf_counter()
